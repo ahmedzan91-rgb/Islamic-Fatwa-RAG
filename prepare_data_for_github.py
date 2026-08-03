@@ -13,17 +13,22 @@ prepare_data_for_github.py
     لكن بضغط gzip ينكمش إلى ~50 ميجابايت → يمرّ بنجاح.
 
     هذه الأداة:
-      1. تفحص أحجام ملفاتك وتصنّفها (آمن / تحذير / مرفوض).
-      2. تضغطها بـ gzip (النظام يقرأ .csv.gz مباشرة بلا فكّ).
-      3. تقسّم الملفات الضخمة جداً إلى أجزاء تحت الحدّ.
-      4. تحدّث .gitignore ليسمح بالبيانات المضغوطة.
-      5. تعرض تقريراً بما سيُرفع وحجمه الكلي.
+      1. تبحث عن ملفاتك تلقائياً (حتى لو لم تكن في مجلد data/).
+      2. تفحص أحجامها وتصنّفها (آمن / تحذير / مرفوض).
+      3. تضغطها بـ gzip — والنظام يقرأ .csv.gz مباشرة بلا فكّ.
+      4. تقسّم الضخم منها بحجم تكيّفي تحت الحدّ.
+      5. تحدّث .gitignore وتطبع أوامر الرفع الجاهزة.
 
-الاستخدام:
-    python prepare_data_for_github.py                    # فحص فقط (بلا تعديل)
-    python prepare_data_for_github.py --compress         # ضغط الملفات
-    python prepare_data_for_github.py --compress --split # ضغط + تقسيم الضخم
-    python prepare_data_for_github.py --sample 20000     # إنشاء عيّنة خفيفة
+الاستخدام (ويندوز / لينكس / ماك):
+    python prepare_data_for_github.py                     فحص فقط
+    python prepare_data_for_github.py --find              البحث عن ملفات CSV
+    python prepare_data_for_github.py --compress          ضغط
+    python prepare_data_for_github.py --compress --split  ضغط وتقسيم
+    python prepare_data_for_github.py --data-dir "C:\\path\\to\\csv"
+
+⚠️ ملاحظة لمستخدمي ويندوز (CMD):
+    لا تنسخ التعليقات العربية بعد الأمر — CMD لا يفهم "#" كتعليق
+    وسيعتبرها وسيطاً غير معروف. انسخ الأمر وحده.
 """
 
 from __future__ import annotations
@@ -36,14 +41,24 @@ import sys
 from typing import List, Optional, Tuple
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, "data")
 
 MB = 1024 * 1024
 GITHUB_HARD_LIMIT = 100 * MB      # رفض قاطع
 GITHUB_WARN_LIMIT = 50 * MB       # تحذير فقط
-SAFE_TARGET = 45 * MB             # هدفنا عند التقسيم
+SAFE_TARGET = 45 * MB             # هدف الحجم المضغوط عند التقسيم
 
 TABULAR_EXTENSIONS = (".csv", ".tsv", ".txt", ".xlsx", ".xls")
+# ملفات نصية شائعة ليست بيانات — نستبعدها من البحث
+SKIP_FILENAMES = {
+    "requirements.txt", "requirements-full.txt", "packages.txt",
+    "readme.txt", "license.txt", "changelog.txt", "notes.txt",
+    "runtime.txt", "constraints.txt", "todo.txt",
+}
+
+SKIP_DIRECTORIES = {
+    ".git", "__pycache__", ".venv", "venv", "node_modules",
+    "chroma_db", "artifacts", ".idea", ".vscode", "env",
+}
 
 
 # ----------------------------------------------------------------------------- #
@@ -68,13 +83,15 @@ def verdict(size: int) -> Tuple[str, str]:
 
 
 def list_data_files(data_dir: str) -> List[str]:
-    """سرد ملفات البيانات (غير المضغوطة) في المجلد."""
+    """سرد ملفات البيانات الخام (غير المضغوطة) في المجلد."""
     if not os.path.isdir(data_dir):
         return []
     found = []
     for name in sorted(os.listdir(data_dir)):
         path = os.path.join(data_dir, name)
         if not os.path.isfile(path) or name.startswith((".", "_")):
+            continue
+        if name.lower() in SKIP_FILENAMES:
             continue
         if name.lower().endswith(TABULAR_EXTENSIONS):
             found.append(path)
@@ -93,26 +110,151 @@ def list_compressed_files(data_dir: str) -> List[str]:
 
 
 # ----------------------------------------------------------------------------- #
+#                       اكتشاف مجلد البيانات ومستودع Git                          #
+# ----------------------------------------------------------------------------- #
+
+def find_repo_root(start: str) -> Optional[str]:
+    """الصعود في الشجرة بحثاً عن جذر مستودع Git (مجلد .git)."""
+    current = os.path.abspath(start)
+    while True:
+        if os.path.isdir(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def resolve_data_dir(explicit: Optional[str]) -> Tuple[str, str]:
+    """
+    تحديد مجلد البيانات تلقائياً.
+
+    ترتيب البحث:
+        1. المسار الصريح عبر --data-dir
+        2. <مجلد السكربت>/data
+        3. <مجلد السكربت> نفسه
+        4. <مجلد العمل الحالي>/data
+        5. <مجلد العمل الحالي> نفسه
+
+    Returns:
+        (المسار, سبب الاختيار)
+    """
+    if explicit:
+        return os.path.abspath(explicit), "محدّد عبر --data-dir"
+
+    cwd = os.getcwd()
+    candidates = [
+        (os.path.join(BASE_DIR, "data"), "مجلد data بجانب السكربت"),
+        (BASE_DIR, "مجلد السكربت نفسه"),
+        (os.path.join(cwd, "data"), "مجلد data في مسار التشغيل"),
+        (cwd, "مسار التشغيل الحالي"),
+    ]
+
+    # نفضّل أول مجلد يحوي ملفات فعلية
+    for path, reason in candidates:
+        if list_data_files(path) or list_compressed_files(path):
+            return os.path.abspath(path), reason
+
+    return os.path.join(BASE_DIR, "data"), "الافتراضي (فارغ)"
+
+
+def find_csv_files_recursive(root: str, max_depth: int = 3, limit: int = 300) -> List[str]:
+    """بحث تكراري عن ملفات جدولية لمساعدة المستخدم على تحديد مكان بياناته."""
+    results: List[str] = []
+    root = os.path.abspath(root)
+    root_depth = root.rstrip(os.sep).count(os.sep)
+
+    for current, directories, files in os.walk(root):
+        directories[:] = [d for d in directories if d not in SKIP_DIRECTORIES]
+        if current.rstrip(os.sep).count(os.sep) - root_depth >= max_depth:
+            directories[:] = []
+        for name in files:
+            lowered = name.lower()
+            if lowered in SKIP_FILENAMES:
+                continue
+            if lowered.endswith(TABULAR_EXTENSIONS) or lowered.endswith(".gz"):
+                results.append(os.path.join(current, name))
+                if len(results) >= limit:
+                    return results
+    return results
+
+
+def run_find_mode(start: str) -> int:
+    """وضع --find: البحث عن ملفات البيانات وعرض مواقعها."""
+    print("=" * 74)
+    print("  البحث عن ملفات البيانات")
+    print("=" * 74)
+
+    search_roots = []
+    for candidate in (os.getcwd(), BASE_DIR, os.path.expanduser("~/Desktop"),
+                      os.path.expanduser("~")):
+        candidate = os.path.abspath(candidate)
+        if candidate not in search_roots and os.path.isdir(candidate):
+            search_roots.append(candidate)
+
+    seen = set()
+    found_any = False
+
+    for root in search_roots[:3]:
+        print(f"\n  🔎 البحث في: {root}")
+        results = find_csv_files_recursive(root, max_depth=3)
+        results = [p for p in results if p not in seen]
+        if not results:
+            print("     (لا شيء)")
+            continue
+
+        found_any = True
+        by_directory: dict = {}
+        for path in results:
+            seen.add(path)
+            by_directory.setdefault(os.path.dirname(path), []).append(path)
+
+        for directory, paths in sorted(by_directory.items())[:10]:
+            total = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
+            print(f"\n     📁 {directory}")
+            print(f"        {len(paths)} ملف — {human(total)}")
+            for path in paths[:5]:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+                icon, _ = verdict(size)
+                print(f"        {icon} {os.path.basename(path):<40}{human(size):>12}")
+            if len(paths) > 5:
+                print(f"        ... و{len(paths) - 5} ملف آخر")
+
+    if not found_any:
+        print("\n  ⚠️  لم يُعثر على أي ملف بيانات.")
+        return 1
+
+    print("\n" + "─" * 74)
+    print("  💡 شغّل الأداة على المجلد الصحيح:")
+    print('     python prepare_data_for_github.py --data-dir "المسار" --compress')
+    print()
+    return 0
+
+
+# ----------------------------------------------------------------------------- #
 #                                  الفحص                                         #
 # ----------------------------------------------------------------------------- #
 
-def scan(data_dir: str) -> Tuple[List[str], List[str], int]:
-    """
-    فحص مجلد البيانات وطباعة تقرير.
-
-    Returns:
-        (الملفات الخام, الملفات المضغوطة, الحجم الكلي)
-    """
+def scan(data_dir: str, reason: str = "") -> Tuple[List[str], List[str], int]:
+    """فحص مجلد البيانات وطباعة تقرير."""
     raw = list_data_files(data_dir)
     compressed = list_compressed_files(data_dir)
 
     print("=" * 74)
-    print("  فحص مجلد البيانات:", data_dir)
+    print("  فحص مجلد البيانات")
     print("=" * 74)
+    print(f"\n  📂 {data_dir}")
+    if reason:
+        print(f"     ({reason})")
 
     if not raw and not compressed:
-        print("\n  ⚠️  لا توجد ملفات بيانات.")
-        print(f"     ضع ملفات CSV في: {data_dir}\n")
+        print("\n  ⚠️  لا توجد ملفات بيانات في هذا المجلد.\n")
+        print("  جرّب أحد الحلول:")
+        print("     1. ابحث عن ملفاتك:")
+        print("        python prepare_data_for_github.py --find")
+        print("     2. حدّد المجلد يدوياً:")
+        print('        python prepare_data_for_github.py --data-dir "C:\\مسار\\ملفاتي"')
+        print("     3. انقل ملفات CSV إلى المجلد أعلاه.\n")
         return [], [], 0
 
     total = 0
@@ -146,9 +288,11 @@ def scan(data_dir: str) -> Tuple[List[str], List[str], int]:
 
     blocked = [p for p in raw + compressed if os.path.getsize(p) >= GITHUB_HARD_LIMIT]
     if blocked:
-        print(f"\n  ❌ {len(blocked)} ملف سيرفضه GitHub. شغّل: --compress (و --split عند اللزوم)")
+        print(f"\n  ❌ {len(blocked)} ملف سيرفضه GitHub.")
+        print("     شغّل: python prepare_data_for_github.py --compress --split")
     elif raw:
-        print("\n  💡 ملفاتك الخام مستثناة في .gitignore. شغّل --compress لتجهيزها للرفع.")
+        print("\n  💡 لتجهيز الملفات للرفع:")
+        print("     python prepare_data_for_github.py --compress")
     print()
     return raw, compressed, total
 
@@ -165,10 +309,12 @@ def compress_file(path: str, level: int = 9, keep_original: bool = True) -> Opti
         return destination
 
     original_size = os.path.getsize(path)
-    print(f"     🗜️  ضغط {os.path.basename(path)} ({human(original_size)})...", end="", flush=True)
+    print(f"     🗜️  ضغط {os.path.basename(path)} ({human(original_size)})...",
+          end="", flush=True)
 
     try:
-        with open(path, "rb") as source, gzip.open(destination, "wb", compresslevel=level) as target:
+        with open(path, "rb") as source, \
+             gzip.open(destination, "wb", compresslevel=level) as target:
             shutil.copyfileobj(source, target, length=4 * MB)
     except Exception as exc:  # noqa: BLE001
         print(f" فشل: {exc}")
@@ -241,7 +387,7 @@ def create_sample(source_path: str, rows: int, data_dir: str) -> Optional[str]:
     try:
         with open(source_path, "r", encoding="utf-8-sig", errors="replace") as source, \
              open(destination, "w", encoding="utf-8-sig") as target:
-            target.write(source.readline())          # الترويسة
+            target.write(source.readline())
             for i, line in enumerate(source):
                 if i >= rows:
                     break
@@ -262,30 +408,35 @@ def create_sample(source_path: str, rows: int, data_dir: str) -> Optional[str]:
 
 GITIGNORE_MARKER = "# ── بيانات الفتاوى المضغوطة (مسموح برفعها) ──"
 
-GITIGNORE_RULES = f"""
-{GITIGNORE_MARKER}
-# الملفات الخام تبقى مستثناة (كبيرة جداً على GitHub)،
-# لكن النسخ المضغوطة .gz مسموح برفعها — والنظام يقرؤها مباشرة.
-!data/*.csv.gz
-!data/*.tsv.gz
-"""
 
+def update_gitignore(repo_root: Optional[str], data_dir: str) -> bool:
+    """إضافة استثناء يسمح برفع الملفات المضغوطة (بمسار نسبي صحيح)."""
+    if not repo_root:
+        return False
 
-def update_gitignore(base_dir: str) -> bool:
-    """إضافة استثناء يسمح برفع الملفات المضغوطة."""
-    path = os.path.join(base_dir, ".gitignore")
+    relative = os.path.relpath(data_dir, repo_root).replace(os.sep, "/")
+    prefix = "" if relative == "." else f"{relative}/"
+
+    path = os.path.join(repo_root, ".gitignore")
     content = ""
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as fh:
             content = fh.read()
 
-    if GITIGNORE_MARKER in content:
+    rules = (
+        f"\n{GITIGNORE_MARKER}\n"
+        "# الخام كبير جداً على GitHub، لكن المضغوط يمرّ — والنظام يقرأ .gz مباشرة.\n"
+        f"!{prefix}*.csv.gz\n"
+        f"!{prefix}*.tsv.gz\n"
+    )
+
+    if f"!{prefix}*.csv.gz" in content:
         print("     ⏭️  .gitignore محدَّث مسبقاً.")
         return False
 
     with open(path, "a", encoding="utf-8") as fh:
-        fh.write(GITIGNORE_RULES)
-    print("     ✅ حُدّث .gitignore للسماح برفع ملفات .gz")
+        fh.write(rules)
+    print(f"     ✅ حُدّث .gitignore للسماح برفع: {prefix}*.csv.gz")
     return True
 
 
@@ -293,26 +444,54 @@ def update_gitignore(base_dir: str) -> bool:
 #                                  التعليمات                                     #
 # ----------------------------------------------------------------------------- #
 
-def print_push_instructions(files: List[str]) -> None:
-    """طباعة أوامر الرفع الجاهزة."""
+def print_push_instructions(files: List[str], repo_root: Optional[str],
+                            data_dir: str) -> None:
+    """طباعة أوامر الرفع الجاهزة، أو إرشاد المستخدم إن لم يكن داخل مستودع."""
     if not files:
         return
 
-    total = sum(os.path.getsize(f) for f in files)
+    total = sum(os.path.getsize(f) for f in files if os.path.exists(f))
 
     print("\n" + "=" * 74)
-    print("  الخطوة التالية: الرفع إلى GitHub")
+    print("  الخطوة التالية")
     print("=" * 74)
-    print(f"\n  سيُرفع {len(files)} ملف بحجم كلي {human(total)}\n")
+    print(f"\n  الملفات الجاهزة: {len(files)} — الحجم الكلي: {human(total)}")
+
+    if not repo_root:
+        print("\n  ⚠️  هذا المجلد ليس داخل مستودع Git — لذلك لا يمكن الرفع من هنا.\n")
+        print("  ✅ لكن ملفاتك المضغوطة جاهزة في:")
+        print(f"     {data_dir}\n")
+        print("  " + "─" * 70)
+        print("  الخطوات التالية (انسخ كل سطر وحده):")
+        print("  " + "─" * 70 + "\n")
+        print("  1) استنسخ المستودع على سطح المكتب:\n")
+        print("     cd %USERPROFILE%\\Desktop")
+        print("     git clone https://github.com/ahmedzan91-rgb/Islamic-Fatwa-RAG.git\n")
+        print("  2) انسخ الملفات المضغوطة إلى مجلد data:\n")
+        print(f'     copy "{data_dir}\\*.gz" "%USERPROFILE%\\Desktop\\Islamic-Fatwa-RAG\\data\\"\n')
+        print("  3) ادخل المستودع وارفع:\n")
+        print("     cd %USERPROFILE%\\Desktop\\Islamic-Fatwa-RAG")
+        print("     python prepare_data_for_github.py")
+        print("     git add data/*.gz .gitignore")
+        print('     git commit -m "data: add fatwa dataset"')
+        print("     git push\n")
+        return
+
+    relative = os.path.relpath(data_dir, repo_root).replace(os.sep, "/")
+    prefix = "" if relative == "." else f"{relative}/"
+
+    print("\n  نفّذ هذه الأوامر (من مجلد المستودع):\n")
     print("  ┌" + "─" * 70 + "┐")
-    print("  │ git add data/*.gz .gitignore" + " " * 41 + "│")
-    print('  │ git commit -m "data: إضافة بيانات الفتاوى المضغوطة"' + " " * 18 + "│")
-    print("  │ git push" + " " * 61 + "│")
+    line1 = f"git add {prefix}*.gz .gitignore"
+    line2 = 'git commit -m "data: add compressed fatwa dataset"'
+    print(f"  │ {line1:<69}│")
+    print(f"  │ {line2:<69}│")
+    print(f"  │ {'git push':<69}│")
     print("  └" + "─" * 70 + "┘")
 
     if total > 300 * MB:
-        print("\n  ⚠️  الحجم الكلي كبير. GitHub يحدّ كل دفعة push بـ 2 GB.")
-        print("     ارفع على دفعات: git add data/ملف_واحد.gz && git commit && git push")
+        print("\n  ⚠️  الحجم كبير. GitHub يحدّ كل دفعة push بـ 2 GB.")
+        print("     ارفع على دفعات: أضِف ملفاً واحداً في كل commit.")
 
     print("\n  💡 بعد الرفع، النظام يقرأ ملفات .gz مباشرة بلا فكّ ضغط:")
     print("     python run_pipeline.py --limit 2000\n")
@@ -325,24 +504,37 @@ def print_push_instructions(files: List[str]) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="تجهيز بيانات الفتاوى لرفعها إلى GitHub.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="ملاحظة لويندوز: لا تنسخ التعليقات بعد الأمر — CMD لا يفهم '#'.",
     )
-    parser.add_argument("--data-dir", default=DATA_DIR, help="مجلد البيانات.")
+    parser.add_argument("--data-dir", default=None,
+                        help="مجلد البيانات (يُكتشف تلقائياً إن لم يُحدَّد).")
+    parser.add_argument("--find", action="store_true",
+                        help="البحث عن ملفات CSV في جهازك وعرض مواقعها.")
     parser.add_argument("--compress", action="store_true", help="ضغط الملفات بـ gzip.")
     parser.add_argument("--split", action="store_true",
                         help="تقسيم الملفات التي تبقى فوق الحدّ بعد الضغط.")
     parser.add_argument("--delete-original", action="store_true",
-                        help="حذف الملف الخام بعد الضغط (وفّر مساحة).")
+                        help="حذف الملف الخام بعد الضغط.")
     parser.add_argument("--sample", type=int, default=0,
-                        help="إنشاء عيّنة بعدد الصفوف المحدّد بدل رفع الكل.")
+                        help="إنشاء عيّنة بعدد الصفوف المحدّد.")
     parser.add_argument("--level", type=int, default=9, choices=range(1, 10),
                         help="مستوى الضغط (1=سريع، 9=أقصى).")
     args = parser.parse_args(argv)
 
-    data_dir = os.path.abspath(args.data_dir)
-    os.makedirs(data_dir, exist_ok=True)
+    # ─────────────── وضع البحث ─────────────── #
+    if args.find:
+        return run_find_mode(os.getcwd())
 
-    raw, compressed, _ = scan(data_dir)
+    data_dir, reason = resolve_data_dir(args.data_dir)
+    os.makedirs(data_dir, exist_ok=True)
+    repo_root = find_repo_root(data_dir)
+
+    raw, compressed, _ = scan(data_dir, reason)
+
+    if repo_root:
+        print(f"  🐙 مستودع Git: {repo_root}\n")
+    else:
+        print("  ⚠️  لست داخل مستودع Git — سأجهّز الملفات فقط.\n")
 
     # ─────────────── وضع العيّنة ─────────────── #
     if args.sample:
@@ -355,34 +547,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         samples = []
         for path in raw:
             if path.lower().endswith((".xlsx", ".xls")):
-                print(f"     ⏭️  تخطّي {os.path.basename(path)} (Excel غير مدعوم للعيّنة)")
+                print(f"     ⏭️  تخطّي {os.path.basename(path)} (Excel — حوّله إلى CSV)")
                 continue
             result = create_sample(path, args.sample, data_dir)
             if result:
                 samples.append(result)
         print()
-        update_gitignore(BASE_DIR)
-        # العيّنات صغيرة عادةً — نرفعها كما هي
-        if samples:
-            path = os.path.join(BASE_DIR, ".gitignore")
-            with open(path, "a", encoding="utf-8") as fh:
+        if samples and repo_root:
+            relative = os.path.relpath(data_dir, repo_root).replace(os.sep, "/")
+            prefix = "" if relative == "." else f"{relative}/"
+            with open(os.path.join(repo_root, ".gitignore"), "a", encoding="utf-8") as fh:
+                fh.write(f"\n# عيّنات خفيفة للعرض\n")
                 for sample in samples:
-                    fh.write(f"!data/{os.path.basename(sample)}\n")
+                    fh.write(f"!{prefix}{os.path.basename(sample)}\n")
             print(f"     ✅ أُضيفت {len(samples)} عيّنة إلى .gitignore")
-        print_push_instructions(samples)
+        print_push_instructions(samples, repo_root, data_dir)
         return 0
 
     # ─────────────── وضع الفحص فقط ─────────────── #
     if not args.compress:
-        print("  ℹ️  وضع الفحص فقط — لم يُعدَّل شيء.")
-        print("     للضغط والتجهيز شغّل: python prepare_data_for_github.py --compress\n")
+        if raw or compressed:
+            print("  ℹ️  وضع الفحص فقط — لم يُعدَّل شيء.")
+            print("     للضغط: python prepare_data_for_github.py --compress\n")
         return 0
 
     if not raw:
         print("  ⚠️  لا توجد ملفات خام للضغط.\n")
         if compressed:
-            update_gitignore(BASE_DIR)
-            print_push_instructions(compressed)
+            update_gitignore(repo_root, data_dir)
+            print_push_instructions(compressed, repo_root, data_dir)
         return 0
 
     # ─────────────── الضغط ─────────────── #
@@ -396,8 +589,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"     ⏭️  تخطّي {os.path.basename(path)} — حوّله إلى CSV أولاً.")
             continue
 
-        # نُبقي الأصل مؤقتاً حتى نتأكد أننا لن نحتاجه للتقسيم،
-        # ثم نحذفه في النهاية إن طُلب ذلك.
+        # نُبقي الأصل حتى نتأكد أننا لن نحتاجه للتقسيم
         result = compress_file(path, args.level, keep_original=True)
         if not result:
             continue
@@ -408,9 +600,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if needs_split and args.split:
             print(f"     ⚠️  {os.path.basename(result)} ما زال فوق الحدّ — التقسيم...")
 
-            # حساب هدف تقسيم تكيّفي: الحدّ يُطبَّق على الحجم *المضغوط*،
-            # لذا نضرب الهدف بنسبة الضغط الفعلية المقيسة لهذا الملف تحديداً،
-            # فنحصل على أقل عدد ممكن من الأجزاء بدل تفتيتها بلا داعٍ.
+            # هدف تكيّفي: الحدّ يُطبَّق على الحجم *المضغوط*، فنضرب الهدف
+            # بنسبة الضغط المقيسة لهذا الملف → أقل عدد أجزاء ممكن.
             ratio = os.path.getsize(path) / max(compressed_size, 1)
             adaptive_target = int(SAFE_TARGET * ratio)
             print(f"        نسبة الضغط المقيسة: {ratio:.1f}× → "
@@ -419,7 +610,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             os.remove(result)
             for part in split_large_file(path, adaptive_target):
                 if os.path.abspath(part) == os.path.abspath(path):
-                    continue  # لم يحدث تقسيم فعلي
+                    continue
                 part_gz = compress_file(part, args.level, keep_original=False)
                 if part_gz:
                     ready.append(part_gz)
@@ -429,29 +620,39 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             ready.append(result)
 
-        # حذف الأصل بعد انتهاء كل العمليات التي قد تحتاجه
         if args.delete_original and os.path.exists(path):
             os.remove(path)
             print(f"     🗑️  حُذف الأصل: {os.path.basename(path)}")
 
     print()
-    update_gitignore(BASE_DIR)
+    update_gitignore(repo_root, data_dir)
 
     # ─────────────── التقرير النهائي ─────────────── #
     print("\n" + "=" * 74)
     print("  النتيجة")
     print("=" * 74 + "\n")
 
-    uploadable = [f for f in ready if os.path.getsize(f) < GITHUB_HARD_LIMIT]
-    blocked = [f for f in ready if os.path.getsize(f) >= GITHUB_HARD_LIMIT]
+    # إزالة المكرّرات مع الحفاظ على الترتيب (قد يظهر الملف مرتين إن كان
+    # مضغوطاً مسبقاً ثم أُعيد اكتشافه بعد ضغط أصله)
+    unique_ready: List[str] = []
+    seen_paths = set()
+    for candidate in ready:
+        key = os.path.abspath(candidate)
+        if key not in seen_paths and os.path.exists(candidate):
+            seen_paths.add(key)
+            unique_ready.append(candidate)
+
+    uploadable = [f for f in unique_ready if os.path.getsize(f) < GITHUB_HARD_LIMIT]
+    blocked = [f for f in unique_ready if os.path.getsize(f) >= GITHUB_HARD_LIMIT]
 
     for path in uploadable:
         icon, _ = verdict(os.path.getsize(path))
         print(f"     {icon} {os.path.basename(path):<44}{human(os.path.getsize(path)):>12}")
     for path in blocked:
-        print(f"     ❌ {os.path.basename(path):<44}{human(os.path.getsize(path)):>12}  (أضِف --split)")
+        print(f"     ❌ {os.path.basename(path):<44}"
+              f"{human(os.path.getsize(path)):>12}  (أضِف --split)")
 
-    print_push_instructions(uploadable)
+    print_push_instructions(uploadable, repo_root, data_dir)
     return 0 if not blocked else 1
 
 

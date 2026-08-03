@@ -8,6 +8,50 @@
 
 ---
 
+## 🪟 لمستخدمي ويندوز — اقرأ هذا أولاً
+
+### ⚠️ لا تنسخ التعليقات مع الأمر
+
+في CMD الويندوز، الرمز `#` **ليس** تعليقاً كما في لينكس:
+
+```cmd
+REM ❌ خطأ — سيعطي: unrecognized arguments
+python prepare_data_for_github.py --compress --split  # ضغط وتقسيم
+
+REM ✅ صحيح — انسخ الأمر وحده
+python prepare_data_for_github.py --compress --split
+```
+
+### ⚠️ `fatal: not a git repository`
+
+هذا يعني أن المجلد الذي تقف فيه **ليس نسخة من المستودع**. أمر `git pull` يعمل
+فقط داخل مجلد مستنسخ. استنسخ المستودع أولاً:
+
+```cmd
+cd %USERPROFILE%\Desktop
+git clone https://github.com/ahmedzan91-rgb/Islamic-Fatwa-RAG.git
+cd Islamic-Fatwa-RAG
+```
+
+### 📁 أين أضع ملفات CSV؟
+
+الأداة تبحث تلقائياً في: مجلد `data/` بجانب السكربت ← مجلد السكربت نفسه ←
+مجلد التشغيل الحالي. فلا يهم أين وضعتها بالضبط.
+
+**إن لم تجدها، ابحث عنها:**
+
+```cmd
+python prepare_data_for_github.py --find
+```
+
+**أو حدّد المجلد صراحةً (لاحظ علامتَي التنصيص للمسارات ذات المسافات):**
+
+```cmd
+python prepare_data_for_github.py --data-dir "C:\Users\Admin\Desktop\مشروع الفتوي AI\Data" --compress
+```
+
+---
+
 ## ⚡ الطريقة السريعة (٣ أوامر)
 
 ```bash

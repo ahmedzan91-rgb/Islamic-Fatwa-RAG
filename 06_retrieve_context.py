@@ -28,7 +28,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 LOGGER = logging.getLogger("islamic_rag.retrieval")
 logging.basicConfig(
@@ -41,7 +41,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def load_numbered_module(filename: str, alias: str):
-    """استيراد ملف يبدأ اسمه برقم."""
+    """
+    استيراد ملف يبدأ اسمه برقم (لا تدعمه تعليمة import العادية).
+
+    مهم: نتحقق من sys.modules أولاً. بدون هذا الفحص تُعاد تهيئة الوحدة
+    مع كل استيراد فتنشأ نسخ متعددة لها متغيّرات عامة منفصلة — وهو ما كان
+    يسبّب وجود أكثر من singleton لنموذج التضمين، فيُدرَّب أحدها ويُستخدم آخر.
+    """
+    if alias in sys.modules:
+        return sys.modules[alias]
     path = os.path.join(BASE_DIR, filename)
     spec = importlib.util.spec_from_file_location(alias, path)
     if spec is None or spec.loader is None:
@@ -152,6 +160,7 @@ class RetrievalResult:
     has_sufficient_context: bool = False
     max_score: float = 0.0
     total_candidates: int = 0
+    error: str = ""   # رسالة توضيحية عند تعذّر الاسترجاع
 
     def sources_table(self) -> List[Dict[str, Any]]:
         """جدول المصادر لعرضه في واجهة Streamlit."""
@@ -241,6 +250,33 @@ class FatwaRetriever:
             return int(self.collection.count())
         except Exception:  # noqa: BLE001
             return 0
+
+    def is_ready(self) -> Tuple[bool, str]:
+        """
+        التحقق من جاهزية المسترجِع للاستعلام.
+
+        نفحص أمرين: وجود فهرس غير فارغ، وجاهزية نموذج التضمين.
+        الحالة الثانية تحدث عندما يُبنى الفهرس بواجهة TF-IDF على جهاز
+        ثم يُستخدم على آخر دون نقل حالة المُضمِّن معه.
+
+        Returns:
+            (جاهز؟, رسالة توضيحية للمستخدم)
+        """
+        if self.count() == 0:
+            return False, (
+                "قاعدة المتجهات فارغة. ارفع ملفات الفتاوى وابنِ الفهرس "
+                "من تبويب «📤 البيانات والفهرسة»."
+            )
+
+        if getattr(self.model, "needs_fitting", lambda: False)():
+            return False, (
+                "الفهرس موجود لكن نموذج التضمين (TF-IDF) غير مُدرَّب — "
+                "غالباً بُني الفهرس على جهاز آخر ولم تُرفع حالة المُضمِّن معه. "
+                "أعِد بناء الفهرس من تبويب «📤 البيانات والفهرسة»، أو ارفع ملف "
+                "`chroma_db/tfidf_embedder.pkl` مع الفهرس."
+            )
+
+        return True, "جاهز"
 
     def _query_chroma(self, query_text: str, n_results: int, where: Optional[dict] = None) -> dict:
         """تنفيذ الاستعلام المتجهي على ChromaDB."""
@@ -360,9 +396,12 @@ class FatwaRetriever:
         if top_k:
             self.config.top_k = top_k
 
-        if self.count() == 0:
-            LOGGER.warning("قاعدة المتجهات فارغة — شغّل 05_create_chroma_store.py أولاً.")
-            return RetrievalResult(query=query, has_sufficient_context=False)
+        ready, reason = self.is_ready()
+        if not ready:
+            LOGGER.warning("المسترجِع غير جاهز: %s", reason)
+            return RetrievalResult(
+                query=query, has_sufficient_context=False, error=reason
+            )
 
         search_query = expand_query(query) if self.config.enable_query_expansion else query
         query_tokens = tokenize_arabic(query)

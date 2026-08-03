@@ -33,6 +33,8 @@ data/_uploads_registry.json
 
 chroma_db/*
 !chroma_db/.gitkeep
+# حالة مُضمِّن TF-IDF تُرفع مع الفهرس — بدونها يصبح الفهرس غير قابل للاستعلام
+!chroma_db/tfidf_embedder.pkl
 
 *.parquet
 *.sqlite3

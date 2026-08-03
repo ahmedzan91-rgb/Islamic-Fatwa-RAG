@@ -178,8 +178,10 @@ class TfidfEmbedder:
         """تحويل النصوص إلى متجهات مطبّعة (L2)."""
         if not self._fitted:
             raise RuntimeError(
-                "مُضمِّن TF-IDF غير مُدرَّب. استدعِ fit() على المتن أولاً، "
-                "أو حمّل حالة محفوظة عبر load()."
+                "مُضمِّن TF-IDF غير مُدرَّب.\n"
+                "السبب المرجّح: بُني الفهرس على جهاز آخر ولم تُرفع حالة المُضمِّن معه.\n"
+                "الحل: أعِد بناء الفهرس من تبويب «📤 البيانات والفهرسة»، "
+                "أو ارفع ملف artifacts/tfidf_embedder.pkl مع مجلد chroma_db."
             )
         matrix = self._vectorizer.transform(list(texts))
         vectors = self._svd.transform(matrix).astype(np.float32)
@@ -299,18 +301,39 @@ class EmbeddingModel:
             return False
 
     def _load_tfidf(self) -> None:
-        """تفعيل واجهة TF-IDF مع محاولة استعادة حالة محفوظة."""
+        """
+        تفعيل واجهة TF-IDF مع محاولة استعادة حالة محفوظة.
+
+        نبحث في عدة مواضع لأن الفهرس قد يُبنى على جهاز ويُستخدم على آخر:
+          1. المسار المُعدّ (artifacts/)
+          2. داخل مجلد chroma_db (يُرفع عادةً مع الفهرس)
+          3. جذر المشروع
+        """
         self._model = TfidfEmbedder(
             dimension=self.config.tfidf_dimension,
             state_path=self.config.tfidf_state_path,
         )
-        self._model.load()  # محاولة صامتة؛ إن فشلت يُدرَّب لاحقاً
+
+        for candidate in self._state_search_paths():
+            if self._model.load(candidate):
+                break
+
         self._dimension = self._model.dimension
         self._backend = "tfidf"
         LOGGER.info(
             "تم تفعيل واجهة TF-IDF (بلا torch) — مُدرَّب: %s | الأبعاد: %d",
             self._model.is_fitted, self._dimension,
         )
+
+    def _state_search_paths(self) -> List[str]:
+        """المواضع المحتملة لحالة مُضمِّن TF-IDF، مرتّبة حسب الأولوية."""
+        name = "tfidf_embedder.pkl"
+        return [
+            self.config.tfidf_state_path,
+            os.path.join(BASE_DIR, "chroma_db", name),
+            os.path.join(BASE_DIR, "artifacts", name),
+            os.path.join(BASE_DIR, name),
+        ]
 
     def _load(self) -> None:
         """اختيار وتحميل الواجهة الخلفية وفق الإعداد والبيئة."""
@@ -354,6 +377,23 @@ class EmbeddingModel:
         """هل تحتاج الواجهة الحالية إلى تدريب قبل الاستخدام؟"""
         return self._backend == "tfidf" and not self._model.is_fitted
 
+    def _save_state_everywhere(self) -> None:
+        """
+        حفظ حالة المُضمِّن في artifacts/ و chroma_db/ معاً.
+
+        السبب: مجلد chroma_db هو ما يُرفع عادةً مع المشروع، فحفظ الحالة بداخله
+        يضمن أن الفهرس ومُضمِّنه يسافران معاً. بدون ذلك يصبح الفهرس عديم القيمة
+        على جهاز آخر، لأن متجهات TF-IDF لا معنى لها دون المفردات التي دُرِّبت عليها.
+        """
+        for path in {
+            self.config.tfidf_state_path,
+            os.path.join(BASE_DIR, "chroma_db", "tfidf_embedder.pkl"),
+        }:
+            try:
+                self._model.save(path)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("تعذّر حفظ حالة المُضمِّن في %s: %s", path, exc)
+
     def fit_if_needed(self, corpus: Sequence[str], save: bool = True) -> None:
         """
         تدريب المُضمِّن على المتن إن كانت الواجهة تتطلب ذلك.
@@ -366,7 +406,7 @@ class EmbeddingModel:
         self._model.fit(corpus)
         self._dimension = self._model.dimension
         if save:
-            self._model.save()
+            self._save_state_everywhere()
 
     def refit(self, corpus: Sequence[str], save: bool = True) -> None:
         """إعادة تدريب إجبارية (عند تغيّر المتن جذرياً)."""
@@ -375,7 +415,7 @@ class EmbeddingModel:
         self._model.fit(corpus)
         self._dimension = self._model.dimension
         if save:
-            self._model.save()
+            self._save_state_everywhere()
 
     # ------------------------------ التضمين -------------------------------- #
 

@@ -302,9 +302,15 @@ with st.sidebar:
             persist_dir, collection_name, st.session_state.retriever_cache_key
         )
         chunk_count = retriever.count()
-        if chunk_count > 0:
+        ready, ready_reason = retriever.is_ready()
+        if ready:
             st.success(f"✅ جاهزة — {chunk_count:,} جزء")
             st.session_state.index_built = True
+        elif chunk_count > 0:
+            # الفهرس موجود لكن المُضمِّن غير مُدرَّب
+            st.error(f"⚠️ {chunk_count:,} جزء مفهرس — لكن غير قابل للاستعلام")
+            st.caption(ready_reason)
+            st.session_state.index_built = False
         else:
             st.warning("⚠️ فارغة — ارفع بيانات وابنِ الفهرس من تبويب «البيانات».")
             st.session_state.index_built = False
@@ -595,11 +601,18 @@ with tab_chat:
             st.markdown(user_question)
 
         with st.chat_message("assistant", avatar="🕌"):
-            if not st.session_state.index_built or retriever is None:
-                st.error(
-                    "⚠️ قاعدة المتجهات غير جاهزة. انتقل إلى تبويب "
-                    "**📤 البيانات والفهرسة** لرفع ملفات الفتاوى وبناء الفهرس."
-                )
+            if retriever is None:
+                st.error("⚠️ تعذّر فتح قاعدة المتجهات — راجع اللوحة الجانبية.")
+            elif not st.session_state.index_built:
+                _, reason = retriever.is_ready()
+                st.error(f"⚠️ {reason}")
+                if retriever.count() > 0:
+                    st.info(
+                        "💡 **لماذا حدث هذا؟** متجهات TF-IDF تعتمد على المفردات التي "
+                        "دُرِّب عليها المُضمِّن. عند بناء الفهرس على جهاز ونقله إلى آخر "
+                        "دون ملف الحالة، تصبح المتجهات بلا مرجع. إعادة البناء تحلّ المشكلة "
+                        "نهائياً وتحفظ الحالة داخل `chroma_db/` تلقائياً."
+                    )
             elif not OPENROUTER_API_KEY:
                 st.error("⚠️ مفتاح `OPENROUTER_API_KEY` غير مُهيَّأ — راجع اللوحة الجانبية.")
             else:
@@ -615,7 +628,9 @@ with tab_chat:
 
                 st.session_state.last_sources = retrieval.chunks
 
-                if not retrieval.has_sufficient_context:
+                if getattr(retrieval, "error", ""):
+                    st.error(f"⚠️ {retrieval.error}")
+                elif not retrieval.has_sufficient_context:
                     st.warning(
                         f"⚠️ لم يُعثر على فتاوى ذات صلة كافية "
                         f"(أعلى تطابق {retrieval.max_score:.3f} < {threshold:.2f}). "

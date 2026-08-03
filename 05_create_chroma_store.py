@@ -55,9 +55,14 @@ DEFAULT_COLLECTION = "islamic_fatwas"
 
 def load_numbered_module(filename: str, alias: str):
     """
-    استيراد ملف يبدأ اسمه برقم (مثل 04_vector_representation.py)،
-    وهو ما لا تسمح به تعليمة import العادية في بايثون.
+    استيراد ملف يبدأ اسمه برقم (لا تدعمه تعليمة import العادية).
+
+    مهم: نتحقق من sys.modules أولاً. بدون هذا الفحص تُعاد تهيئة الوحدة
+    مع كل استيراد فتنشأ نسخ متعددة لها متغيّرات عامة منفصلة — وهو ما كان
+    يسبّب وجود أكثر من singleton لنموذج التضمين، فيُدرَّب أحدها ويُستخدم آخر.
     """
+    if alias in sys.modules:
+        return sys.modules[alias]
     path = os.path.join(BASE_DIR, filename)
     spec = importlib.util.spec_from_file_location(alias, path)
     if spec is None or spec.loader is None:

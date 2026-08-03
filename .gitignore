@@ -1,0 +1,73 @@
+# ═══════════════════════════════════════════════
+#  الأسرار — لا تُرفع أبداً
+# ═══════════════════════════════════════════════
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+credentials.json
+
+# ═══════════════════════════════════════════════
+#  البيانات والمخرجات (ثقيلة / خاصة)
+# ═══════════════════════════════════════════════
+data/*.csv
+data/*.tsv
+data/*.json
+data/*.xlsx
+data/*.csv.gz
+!data/.gitkeep
+
+artifacts/*
+!artifacts/.gitkeep
+
+chroma_db/*
+!chroma_db/.gitkeep
+
+*.parquet
+*.sqlite3
+*.duckdb
+
+# ═══════════════════════════════════════════════
+#  بايثون
+# ═══════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+.venv/
+venv/
+ENV/
+env/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# ═══════════════════════════════════════════════
+#  نماذج ومخابئ Hugging Face
+# ═══════════════════════════════════════════════
+.cache/
+models/
+*.bin
+*.safetensors
+
+# ═══════════════════════════════════════════════
+#  نظام التشغيل والمحرّرات
+# ═══════════════════════════════════════════════
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

@@ -746,6 +746,8 @@ with tab_chat:
                             unsafe_allow_html=True,
                         )
                     answer = "".join(parts).strip()
+                    # توحيد أشكال الإحالة (【مصدر 1】 → [مصدر 1]) قبل العرض النهائي
+                    answer = getattr(prompting, "normalize_citations", lambda t: t)(answer)
                     placeholder.markdown(
                         f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True
                     )
@@ -753,6 +755,8 @@ with tab_chat:
                     with st.spinner("✍️ جارٍ صياغة الإجابة..."):
                         result = client.chat(messages)
                     answer = result.answer if result.success else f"⚠️ {result.error}"
+                    if result.success:
+                        answer = getattr(prompting, "normalize_citations", lambda t: t)(answer)
                     total_tokens = result.total_tokens
                     st.markdown(f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True)
 
@@ -779,7 +783,38 @@ with tab_chat:
                         st.code(answer[:1000])
                     answer = "⚠️ تعذّر عرض الإجابة بسبب خطأ في الترميز."
 
-                # 6) مؤشرات الجودة
+                # 6) عرض المصادر المستشهد بها تحت الإجابة مباشرة
+                cited = getattr(prompting, "extract_citations", lambda a, n: [])(
+                    answer, len(retrieval.chunks)
+                )
+                if cited:
+                    st.markdown("#### 📚 المصادر المستشهد بها")
+                    for number in cited:
+                        chunk = retrieval.chunks[number - 1]
+                        header = chunk.title[:90] or f"فتوى رقم {chunk.fatwa_id}"
+                        with st.expander(
+                            f"[مصدر {number}] {header} — تطابق {chunk.final_score:.2f}"
+                        ):
+                            meta = []
+                            if chunk.fatwa_id:
+                                meta.append(f"**رقم الفتوى:** {chunk.fatwa_id}")
+                            if chunk.source:
+                                meta.append(f"**المصدر:** {chunk.source}")
+                            if chunk.category:
+                                meta.append(f"**التصنيف:** {chunk.category}")
+                            if meta:
+                                st.caption(" &nbsp;|&nbsp; ".join(meta))
+                            if chunk.question:
+                                st.markdown(f"**السؤال:** {chunk.question[:300]}")
+                            st.markdown(f"**نص الفتوى:**\n\n{chunk.text[:1800]}")
+                            if chunk.url:
+                                st.markdown(f"🔗 [الرابط الأصلي]({chunk.url})")
+                    st.caption(
+                        f"عُرضت {len(cited)} من {len(retrieval.chunks)} مصدراً مسترجعاً — "
+                        "البقية في تبويب «📚 المصادر»."
+                    )
+
+                # 7) مؤشرات الجودة
                 grounded = prompting.verify_groundedness(answer, len(retrieval.chunks))
                 metric_cols = st.columns(4)
                 metric_cols[0].metric("⏱️ الاسترجاع", f"{retrieval_time:.2f}s")

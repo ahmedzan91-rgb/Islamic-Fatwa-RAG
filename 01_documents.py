@@ -172,22 +172,74 @@ def build_column_mapping(columns: Iterable[str]) -> Dict[str, str]:
     return mapping
 
 
+def _open_maybe_gzip(path: str, encoding: str):
+    """فتح الملف مع دعم شفّاف لـ gzip حسب الامتداد."""
+    if path.lower().endswith(".gz"):
+        import gzip  # noqa: PLC0415
+
+        return gzip.open(path, "rt", encoding=encoding, errors="strict")
+    return open(path, "r", encoding=encoding)
+
+
+def _arabic_ratio(text: str) -> float:
+    """نسبة المحارف العربية إلى مجموع الحروف — مؤشر صحة فكّ الترميز."""
+    if not text:
+        return 0.0
+    arabic = sum(1 for ch in text if "\u0600" <= ch <= "\u06FF")
+    letters = sum(1 for ch in text if ch.isalpha())
+    return arabic / max(letters, 1)
+
+
 def detect_encoding(path: str) -> str:
     """
-    الكشف عن ترميز الملف بالمحاولة المتدرجة.
-    يقرأ أول 50 سطراً فقط لتسريع العملية على الملفات الضخمة.
+    الكشف عن ترميز الملف (مع دعم .gz).
+
+    ملاحظة مهمة: لا يكفي تجريب الترميزات بالتتابع، لأن cp1256 و latin-1
+    يفكّان **أي** تسلسل بايتات دون رمي استثناء، فيُختاران خطأً لملف UTF-8 سليم.
+    لذلك نحكم على الجودة بنسبة المحارف العربية الناتجة، مع تفضيل UTF-8
+    عند التقارب لأنه الأشيع في البيانات الحديثة.
     """
-    for enc in CANDIDATE_ENCODINGS:
+    # قراءة عيّنة بايتات (مع فكّ gzip إن لزم)
+    try:
+        if path.lower().endswith(".gz"):
+            import gzip  # noqa: PLC0415
+
+            with gzip.open(path, "rb") as fh:
+                sample = fh.read(200_000)
+        else:
+            with open(path, "rb") as fh:
+                sample = fh.read(200_000)
+    except Exception:  # noqa: BLE001
+        return "utf-8"
+
+    if not sample:
+        return "utf-8"
+
+    # علامة BOM حاسمة
+    if sample[:3] == b"\xef\xbb\xbf":
+        return "utf-8-sig"
+
+    # قصّ عند آخر سطر كامل لتفادي بتر محرف متعدد البايتات
+    cut = sample.rfind(b"\n")
+    if cut > 0:
+        sample = sample[:cut]
+
+    best_encoding, best_score = "utf-8", -1.0
+    for encoding in ("utf-8", "cp1256", "windows-1256", "latin-1"):
         try:
-            with open(path, "r", encoding=enc) as fh:
-                for _ in range(50):
-                    line = fh.readline()
-                    if not line:
-                        break
-            return enc
+            decoded = sample.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-    return "utf-8"
+
+        score = _arabic_ratio(decoded)
+        if encoding == "utf-8":
+            score += 0.15  # مكافأة: نجاح فكّ UTF-8 دليل قوي على صحته
+        score -= decoded.count("\ufffd") / max(len(decoded), 1)
+
+        if score > best_score:
+            best_encoding, best_score = encoding, score
+
+    return best_encoding
 
 
 def make_doc_id(source_file: str, fatwa_id: str, row_index: int, text: str) -> str:
@@ -204,7 +256,7 @@ def discover_csv_files(input_path: str) -> List[str]:
     """اكتشاف ملفات CSV سواء كان المسار مجلداً أو ملفاً مفرداً."""
     if os.path.isfile(input_path):
         return [input_path]
-    patterns = ["*.csv", "*.CSV", "*.tsv", "*.csv.gz"]
+    patterns = ["*.csv", "*.CSV", "*.tsv", "*.TSV", "*.csv.gz", "*.tsv.gz", "*.txt"]
     files: List[str] = []
     for pattern in patterns:
         files.extend(glob.glob(os.path.join(input_path, "**", pattern), recursive=True))
@@ -234,7 +286,9 @@ def load_csv_file(
         DataFrame بالمخطط الموحّد UNIFIED_SCHEMA.
     """
     encoding = detect_encoding(path)
-    separator = "\t" if path.lower().endswith(".tsv") else ","
+    lowered = path.lower()
+    base = lowered[:-3] if lowered.endswith(".gz") else lowered
+    separator = "\t" if base.endswith(".tsv") else ","
     if report is not None:
         report.encodings_used[os.path.basename(path)] = encoding
 
@@ -247,6 +301,7 @@ def load_csv_file(
         path,
         encoding=encoding,
         sep=separator,
+        compression="gzip" if lowered.endswith(".gz") else "infer",
         chunksize=chunksize,
         dtype=str,               # نقرأ كل شيء كنص لتفادي تحويل أرقام الفتاوى إلى float
         on_bad_lines="skip",     # تجاهل الأسطر التالفة بدل إيقاف العملية

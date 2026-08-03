@@ -16,8 +16,14 @@ data/*.csv
 data/*.tsv
 data/*.json
 data/*.xlsx
-data/*.csv.gz
 !data/.gitkeep
+
+# ── بيانات الفتاوى المضغوطة (مسموح برفعها) ──
+# الخام كبير جداً على GitHub (139 ألف فتوى ≈ 300 MB > حدّ 100 MB)،
+# لكن المضغوط ≈ 50 MB يمرّ بنجاح — والنظام يقرأ .gz مباشرة بلا فكّ.
+# جهّزها بالأداة:  python prepare_data_for_github.py --compress --split
+!data/*.csv.gz
+!data/*.tsv.gz
 
 artifacts/*
 !artifacts/.gitkeep

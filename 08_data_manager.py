@@ -215,16 +215,27 @@ def validate_tabular_bytes(
     result = ValidationResult(is_valid=False)
     extension = os.path.splitext(filename)[1].lower()
 
+    payload = data
+    if extension == ".gz":
+        try:
+            import gzip
+            payload = gzip.decompress(data)
+            filename = filename[:-3]
+            extension = os.path.splitext(filename)[1].lower()
+        except Exception as exc:  # noqa: BLE001
+            result.errors.append(f"تعذّر فكّ ضغط gzip: {exc}")
+            return result
+
     try:
         if extension in (".xlsx", ".xls"):
-            frame = pd.read_excel(io.BytesIO(data), dtype=str, nrows=2000)
+            frame = pd.read_excel(io.BytesIO(payload), dtype=str, nrows=2000)
             result.encoding = "binary/excel"
         else:
-            encoding = detect_encoding_from_bytes(data)
+            encoding = detect_encoding_from_bytes(payload)
             result.encoding = encoding
             separator = "\t" if extension == ".tsv" else ","
             frame = pd.read_csv(
-                io.BytesIO(data),
+                io.BytesIO(payload),
                 encoding=encoding,
                 sep=separator,
                 dtype=str,
@@ -247,7 +258,7 @@ def validate_tabular_bytes(
     # تقدير عدد الصفوف الكلي (قرأنا عيّنة فقط)
     if extension not in (".xlsx", ".xls"):
         try:
-            result.rows = max(0, data.count(b"\n") - 1)
+            result.rows = max(0, payload.count(b"\n") - 1)
         except Exception:  # noqa: BLE001
             result.rows = len(frame)
     else:

@@ -61,10 +61,16 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
     ],
     "question": [
         "question", "سؤال", "السؤال", "نص السؤال", "نص_السؤال", "q", "query", "الاستفتاء",
+        # مختصرات شائعة في مجموعات البيانات العربية المنشورة
+        "ques", "quest", "questions", "question_text", "q_text", "qtext",
+        "سؤال_الفتوى", "نص الاستفتاء", "السؤال الأصلي", "المسألة",
     ],
     "answer": [
         "answer", "جواب", "الجواب", "الإجابة", "الاجابة", "نص الجواب", "نص_الجواب",
         "a", "response", "الفتوى", "نص الفتوى", "content", "text", "النص",
+        # مختصرات شائعة
+        "ans", "answers", "answer_text", "a_text", "atext", "reply", "body",
+        "الرد", "نص الإجابة", "الحكم", "فتوى", "المحتوى",
     ],
     "category": [
         "category", "قسم", "القسم", "التصنيف", "تصنيف", "section", "topic", "الموضوع الرئيسي",
@@ -224,17 +230,40 @@ def detect_encoding(path: str) -> str:
     if cut > 0:
         sample = sample[:cut]
 
+    # ── الاختبار الحاسم: هل النصّ UTF-8 عربي في جوهره؟ ──
+    # نفكّ بـ errors="replace" فلا يُسقطنا بايتٌ تالف واحد إلى ترميز خاطئ.
+    # ملف مكشوط من الوِب قد يحوي بايتات فاسدة قليلة، وهذا لا يعني أنه cp1256.
+    try:
+        utf8_lenient = sample.decode("utf-8", errors="replace")
+        bad_ratio = utf8_lenient.count("\ufffd") / max(len(utf8_lenient), 1)
+        arabic = _arabic_ratio(utf8_lenient)
+        # إن كان عربياً بوضوح والتلف طفيف (أقل من 2%) فهو UTF-8 قطعاً
+        if arabic > 0.30 and bad_ratio < 0.02:
+            return "utf-8"
+    except Exception:  # noqa: BLE001
+        pass
+
     best_encoding, best_score = "utf-8", -1.0
     for encoding in ("utf-8", "cp1256", "windows-1256", "latin-1"):
         try:
             decoded = sample.decode(encoding)
         except (UnicodeDecodeError, LookupError):
-            continue
+            # نعيد المحاولة بتسامح: البايتات التالفة القليلة لا تُبطل الترميز
+            try:
+                decoded = sample.decode(encoding, errors="replace")
+            except Exception:  # noqa: BLE001
+                continue
 
         score = _arabic_ratio(decoded)
         if encoding == "utf-8":
-            score += 0.15  # مكافأة: نجاح فكّ UTF-8 دليل قوي على صحته
-        score -= decoded.count("\ufffd") / max(len(decoded), 1)
+            score += 0.15  # مكافأة: UTF-8 هو الأشيع في البيانات الحديثة
+
+        # عقوبة مضاعفة على محارف الاستبدال (دليل ترميز خاطئ)
+        score -= 3.0 * decoded.count("\ufffd") / max(len(decoded), 1)
+
+        # عقوبة على "الموجابيك": نمط Ø/Ù/Ã الناتج عن قراءة UTF-8 كـ cp1256
+        mojibake = sum(decoded.count(ch) for ch in "ØÙÃÂðŸ™")
+        score -= 2.0 * mojibake / max(len(decoded), 1)
 
         if score > best_score:
             best_encoding, best_score = encoding, score

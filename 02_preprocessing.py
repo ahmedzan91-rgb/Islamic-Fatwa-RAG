@@ -110,6 +110,7 @@ class PreprocessConfig:
     drop_duplicates: bool = True
     strip_opening_formulas_in_search: bool = True
     keep_diacritics_in_display: bool = True
+    drop_corrupted_text: bool = True   # رفض نصوص الموجابيك
 
 
 # ----------------------------------------------------------------------------- #
@@ -184,6 +185,47 @@ def remove_opening_formulas(text: str) -> str:
     return text.strip()
 
 
+# محارف الموجابيك: تنتج عن قراءة UTF-8 بترميز أحادي البايت.
+# نمطان رئيسيان:
+#   cp1252/latin-1 → Ø§ÙØ­ÙØ¯   (محارف لاتينية ممدودة)
+#   cp1256        → ط§ظ„ط­ظ…ط¯  (محارف عربية لكن بتوزيع شاذ)
+MOJIBAKE_LATIN = set("ØÙÚÛÃÂÐÑðŸ™Œ›œž¢£¤¥¦§¨©ª«¬")
+
+# في موجابيك cp1256 تتكرّر هذه المحارف بكثافة غير طبيعية،
+# وتظهر ثنائيات مثل "ط§" و "ظ„" التي لا ترد في العربية السليمة
+RE_MOJIBAKE_CP1256 = re.compile(r"[طظ][\u0600-\u06FF]")
+
+
+def mojibake_ratio(text: str) -> float:
+    """
+    نسبة أنماط "الموجابيك" في النص.
+
+    الموجابيك تشويه ناتج عن قراءة نص UTF-8 بترميز أحادي البايت.
+    نكشف نمطين: اللاتيني (Ø§ÙØ­ÙØ¯) والعربي (ط§ظ„ط­ظ…ط¯).
+    """
+    if not text:
+        return 0.0
+    sample = text[:2000]
+    length = max(len(sample), 1)
+
+    latin_hits = sum(1 for ch in sample if ch in MOJIBAKE_LATIN)
+    cp1256_hits = len(RE_MOJIBAKE_CP1256.findall(sample))
+
+    return max(latin_hits, cp1256_hits) / length
+
+
+def is_text_corrupted(text: str, threshold: float = 0.05) -> bool:
+    """
+    هل النص تالف (موجابيك) بدرجة تمنع الاستفادة منه؟
+
+    فهرسة نصّ مشوّه تُنتج إجابات مشوّهة لا يستطيع المستخدم قراءتها،
+    لذا نرفضه مبكراً مع رسالة تشرح السبب بدل تمريره صامتاً.
+    """
+    if not text or len(text) < 20:
+        return False
+    return mojibake_ratio(text) > threshold
+
+
 def content_fingerprint(text: str) -> str:
     """بصمة MD5 للنص المطبّع — تُستخدم لكشف التكرار الحرفي وشبه الحرفي."""
     return hashlib.md5(normalize_arabic(text).encode("utf-8")).hexdigest()
@@ -248,22 +290,44 @@ def preprocess_documents(
     if df.empty:
         return df
 
-    # 3) بناء النص المُركّب
+    # 3) رفض النصوص التالفة (موجابيك) قبل الفهرسة
+    if config.drop_corrupted_text:
+        before = len(df)
+        corrupted_mask = df["answer_clean"].apply(is_text_corrupted)
+        corrupted_count = int(corrupted_mask.sum())
+        if corrupted_count:
+            samples = df.loc[corrupted_mask, "answer_clean"].head(2).tolist()
+            LOGGER.error(
+                "⚠️ رُصد %d نص تالف (موجابيك) — غالباً خطأ ترميز في ملف المصدر. مثال: %s",
+                corrupted_count, samples[0][:80] if samples else "",
+            )
+        df = df[~corrupted_mask].reset_index(drop=True)
+        if before != len(df):
+            LOGGER.info("حُذف %d نص تالف.", before - len(df))
+
+    if df.empty:
+        LOGGER.error(
+            "كل النصوص تالفة! المشكلة في ترميز ملف CSV المصدر. "
+            "حوّله إلى UTF-8: iconv -f WINDOWS-1256 -t UTF-8 in.csv > out.csv"
+        )
+        return df
+
+    # 4) بناء النص المُركّب
     df["composite_text"] = df.apply(build_composite_text, axis=1)
 
-    # 4) بناء نص البحث المطبّع
+    # 5) بناء نص البحث المطبّع
     df["search_text"] = df["composite_text"].apply(normalize_arabic)
     if config.strip_opening_formulas_in_search:
         df["search_text"] = df["search_text"].apply(remove_opening_formulas)
 
-    # 5) كشف التكرار
+    # 6) كشف التكرار
     df["fingerprint"] = df["answer_clean"].apply(content_fingerprint)
     if config.drop_duplicates:
         before = len(df)
         df = df.drop_duplicates(subset=["fingerprint"], keep="first").reset_index(drop=True)
         LOGGER.info("حذف %d فتوى مكرّرة.", before - len(df))
 
-    # 6) إحصاءات نصية للتوثيق الأكاديمي
+    # 7) إحصاءات نصية للتوثيق الأكاديمي
     df["char_count"] = df["composite_text"].str.len()
     df["word_count"] = df["composite_text"].str.split().str.len().fillna(0).astype(int)
 

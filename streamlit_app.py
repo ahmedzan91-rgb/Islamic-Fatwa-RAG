@@ -71,6 +71,64 @@ os.environ["OPENROUTER_MODEL"] = OPENROUTER_MODEL
 #                     تحميل الوحدات المرقّمة (01 → 08)                            #
 # ----------------------------------------------------------------------------- #
 
+def compute_code_version() -> str:
+    """
+    بصمة مجمّعة لكل ملفات المشروع (الحجم + وقت التعديل).
+
+    تُمرَّر إلى دوال @st.cache_resource كوسيط، فيُبطل Streamlit المخبأ تلقائياً
+    عند أي تحديث للشيفرة. بدون هذا يبقى كائن قديم محفوظاً في الذاكرة بعد الرفع،
+    فتُستدعى عليه دوال لم تكن موجودة وقت إنشائه → AttributeError.
+    """
+    import hashlib
+
+    digest = hashlib.md5()
+    for name in sorted(os.listdir(BASE_DIR)):
+        if not name.endswith(".py"):
+            continue
+        try:
+            stat = os.stat(os.path.join(BASE_DIR, name))
+            digest.update(f"{name}:{stat.st_size}:{int(stat.st_mtime)}".encode())
+        except OSError:
+            continue
+    return digest.hexdigest()[:12]
+
+
+CODE_VERSION = compute_code_version()
+
+
+def retriever_readiness(retriever_obj) -> tuple:
+    """
+    فحص جاهزية المسترجِع بأمان تام.
+
+    نستخدم getattr بدل الاستدعاء المباشر لأن كائناً قديماً قد يبقى في
+    ذاكرة Streamlit المؤقتة بعد تحديث الشيفرة، فلا تكون is_ready معرّفة عليه.
+    في هذه الحالة نعود إلى فحص العدّ البسيط بدل رمي AttributeError.
+
+    Returns:
+        (جاهز؟, رسالة, عدد الأجزاء)
+    """
+    if retriever_obj is None:
+        return False, "تعذّر فتح قاعدة المتجهات.", 0
+
+    try:
+        count = int(retriever_obj.count())
+    except Exception:  # noqa: BLE001
+        return False, "تعذّر قراءة قاعدة المتجهات.", 0
+
+    checker = getattr(retriever_obj, "is_ready", None)
+    if callable(checker):
+        try:
+            ready, reason = checker()
+            return bool(ready), str(reason), count
+        except Exception as exc:  # noqa: BLE001
+            return False, f"تعذّر فحص الجاهزية: {exc}", count
+
+    # كائن قديم من مخبأ سابق — نكتفي بفحص العدّ ونطلب إعادة التشغيل
+    if count > 0:
+        return True, "جاهز (فحص مبسّط — أعِد تشغيل التطبيق لتفعيل الفحص الكامل).", count
+    return False, "قاعدة المتجهات فارغة.", count
+
+
 def load_numbered_module(filename: str, alias: str):
     """
     استيراد ملف بايثون يبدأ اسمه برقم (مثل 06_retrieve_context.py).
@@ -89,8 +147,17 @@ def load_numbered_module(filename: str, alias: str):
 
 
 @st.cache_resource(show_spinner="⏳ جارٍ تحميل وحدات النظام...")
-def load_pipeline_modules() -> Dict[str, Any]:
-    """تحميل كل وحدات خط الأنابيب مرة واحدة."""
+def load_pipeline_modules(code_version: str = "") -> Dict[str, Any]:
+    """
+    تحميل كل وحدات خط الأنابيب مرة واحدة.
+
+    code_version يُبطل المخبأ عند تحديث الشيفرة. كما ننظّف sys.modules
+    أولاً لضمان إعادة تنفيذ الوحدات بالكود الجديد لا القديم.
+    """
+    for alias in ("documents", "preprocessing", "chunking", "vector_representation",
+                  "create_chroma_store", "retrieve_context", "prompting", "data_manager"):
+        sys.modules.pop(alias, None)
+
     return {
         "documents": load_numbered_module("01_documents.py", "documents"),
         "preprocessing": load_numbered_module("02_preprocessing.py", "preprocessing"),
@@ -104,9 +171,14 @@ def load_pipeline_modules() -> Dict[str, Any]:
 
 
 @st.cache_resource(show_spinner="🧠 جارٍ تهيئة محرّك البحث الدلالي...")
-def get_cached_retriever(persist_dir: str, collection: str, cache_key: int = 0):
-    """إنشاء المسترجِع مرة واحدة. cache_key يسمح بإبطال المخبأ بعد إعادة البناء."""
-    modules = load_pipeline_modules()
+def get_cached_retriever(persist_dir: str, collection: str,
+                         cache_key: int = 0, code_version: str = ""):
+    """
+    إنشاء المسترجِع مرة واحدة.
+    cache_key يُبطل المخبأ بعد إعادة بناء الفهرس،
+    code_version يُبطله بعد تحديث الشيفرة.
+    """
+    modules = load_pipeline_modules(code_version)
     retrieval_module = modules["retrieval"]
     config = retrieval_module.RetrievalConfig(
         persist_directory=persist_dir, collection_name=collection
@@ -197,7 +269,7 @@ def init_session_state() -> None:
 
 
 init_session_state()
-MODULES = load_pipeline_modules()
+MODULES = load_pipeline_modules(CODE_VERSION)
 DATA_MANAGER = MODULES["data_manager"]
 
 
@@ -299,10 +371,10 @@ with st.sidebar:
     retriever = None
     try:
         retriever = get_cached_retriever(
-            persist_dir, collection_name, st.session_state.retriever_cache_key
+            persist_dir, collection_name,
+            st.session_state.retriever_cache_key, CODE_VERSION,
         )
-        chunk_count = retriever.count()
-        ready, ready_reason = retriever.is_ready()
+        ready, ready_reason, chunk_count = retriever_readiness(retriever)
         if ready:
             st.success(f"✅ جاهزة — {chunk_count:,} جزء")
             st.session_state.index_built = True
@@ -604,9 +676,9 @@ with tab_chat:
             if retriever is None:
                 st.error("⚠️ تعذّر فتح قاعدة المتجهات — راجع اللوحة الجانبية.")
             elif not st.session_state.index_built:
-                _, reason = retriever.is_ready()
+                _, reason, chunks_available = retriever_readiness(retriever)
                 st.error(f"⚠️ {reason}")
-                if retriever.count() > 0:
+                if chunks_available > 0:
                     st.info(
                         "💡 **لماذا حدث هذا؟** متجهات TF-IDF تعتمد على المفردات التي "
                         "دُرِّب عليها المُضمِّن. عند بناء الفهرس على جهاز ونقله إلى آخر "

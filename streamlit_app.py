@@ -359,7 +359,10 @@ with st.sidebar:
 
     # ------------------------- معاملات التوليد ------------------------- #
     st.subheader("🎛️ معاملات التوليد")
-    temperature = st.slider("درجة الحرارة", 0.0, 1.0, 0.2, 0.05)
+    temperature = st.slider(
+        "درجة الحرارة", 0.0, 1.0, 0.3, 0.05,
+        help="القيم شديدة الانخفاض (< 0.2) قد تُدخل بعض النماذج في حلقة تكرار.",
+    )
     max_tokens = st.slider("أقصى طول للإجابة", 300, 4000, 1400, 100)
     use_streaming = st.checkbox("بثّ الإجابة تدريجياً", value=True)
     show_context = st.checkbox("إظهار السياق الخام", value=False)
@@ -755,7 +758,16 @@ with tab_chat:
 
                 generation_time = time.time() - generation_started
 
-                # 4) حارس التشويه: نمنع عرض إجابة غير مقروءة
+                # 4) حارس التكرار: بعض النماذج تدخل حلقة تكرار مع العربية
+                if getattr(prompting, "detect_repetition_loop", lambda _: False)(answer):
+                    st.warning(
+                        "⚠️ **رصد النظام تكراراً غير طبيعي في ردّ النموذج.** "
+                        "هذا سلوك معروف لبعض النماذج مع النصوص العربية الطويلة. "
+                        "جرّب نموذجاً آخر (مثل `openai/gpt-4o-mini`) من اللوحة الجانبية، "
+                        "أو ارفع «درجة الحرارة» قليلاً إلى 0.4."
+                    )
+
+                # 5) حارس التشويه: نمنع عرض إجابة غير مقروءة
                 if getattr(prompting, "looks_corrupted", lambda _: False)(answer):
                     st.error(
                         "⚠️ **الإجابة وصلت مشوّهة (خطأ ترميز).** "
@@ -767,7 +779,7 @@ with tab_chat:
                         st.code(answer[:1000])
                     answer = "⚠️ تعذّر عرض الإجابة بسبب خطأ في الترميز."
 
-                # 5) مؤشرات الجودة
+                # 6) مؤشرات الجودة
                 grounded = prompting.verify_groundedness(answer, len(retrieval.chunks))
                 metric_cols = st.columns(4)
                 metric_cols[0].metric("⏱️ الاسترجاع", f"{retrieval_time:.2f}s")

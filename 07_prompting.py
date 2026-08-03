@@ -192,9 +192,15 @@ class GenerationConfig:
     """معاملات توليد الإجابة."""
 
     model: str = ""                 # فارغ = يُقرأ من الأسرار/البيئة
-    temperature: float = 0.2        # منخفضة لضمان الالتزام بالنص الشرعي
+    temperature: float = 0.3        # منخفضة للالتزام بالنص، لا شديدة الانخفاض
     max_tokens: int = 1400
     top_p: float = 0.9
+    # ── مقاومة التكرار ──
+    # مع حرارة منخفضة جداً وبلا عقوبات، تدخل بعض النماذج حلقة تكرار
+    # ("مسلمان مسلمان مسلمان...") ثم تنهار إلى محارف من لغات أخرى.
+    frequency_penalty: float = 0.35   # يعاقب تكرار التوكن بحسب تكراره
+    presence_penalty: float = 0.15    # يشجّع إدخال مفردات جديدة
+    repetition_penalty: float = 1.1   # معامل بديل تدعمه نماذج مفتوحة
     timeout: int = 90
     max_retries: int = 3
     retry_backoff: float = 2.0
@@ -309,6 +315,9 @@ class OpenRouterClient:
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
             "top_p": self.config.top_p,
+            "frequency_penalty": self.config.frequency_penalty,
+            "presence_penalty": self.config.presence_penalty,
+            "repetition_penalty": self.config.repetition_penalty,
             "stream": False,
         }
 
@@ -396,6 +405,9 @@ class OpenRouterClient:
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
             "top_p": self.config.top_p,
+            "frequency_penalty": self.config.frequency_penalty,
+            "presence_penalty": self.config.presence_penalty,
+            "repetition_penalty": self.config.repetition_penalty,
             "stream": True,
         }
 
@@ -419,6 +431,7 @@ class OpenRouterClient:
                 # نقرأ البايتات الخام ونفكّها بـ UTF-8 صراحةً، مع مخزن مؤقت
                 # يحمي المحارف متعددة البايتات من البتر على حدود الدفعات.
                 buffer = b""
+                emitted: List[str] = []
                 for raw_chunk in response.iter_content(chunk_size=None):
                     if not raw_chunk:
                         continue
@@ -438,7 +451,17 @@ class OpenRouterClient:
                             delta = (data.get("choices") or [{}])[0].get("delta") or {}
                             content = delta.get("content")
                             if content:
+                                emitted.append(content)
                                 yield content
+
+                                # فحص دوري لكشف حلقة التكرار وقطع البثّ
+                                if len(emitted) % 40 == 0:
+                                    joined = "".join(emitted)
+                                    if detect_repetition_loop(joined):
+                                        yield ("\n\n_[تم إيقاف التوليد: رصد النظام "
+                                               "تكراراً غير طبيعي في ردّ النموذج. "
+                                               "جرّب نموذجاً آخر من اللوحة الجانبية.]_")
+                                        return
                         except json.JSONDecodeError:
                             continue
         except Exception as exc:  # noqa: BLE001
@@ -460,6 +483,44 @@ class OpenRouterClient:
 # ----------------------------------------------------------------------------- #
 #                            التحقق من التأصيل                                    #
 # ----------------------------------------------------------------------------- #
+
+def detect_repetition_loop(text: str, window: int = 400) -> bool:
+    """
+    كشف دخول النموذج في حلقة تكرار.
+
+    عرض "مسلمان مسلمان مسلمان..." مئات المرات يفسد التجربة ويستهلك التوكنات.
+    نفحص آخر نافذة من النص: إن هبط تنوّع الكلمات أو تكرّر محرف واحد بكثافة
+    شاذة، فالنموذج في حلقة ويجب قطع البثّ.
+    """
+    if not text or len(text) < 120:
+        return False
+
+    tail = text[-window:]
+
+    # (أ) تنوّع الكلمات: نسبة الكلمات الفريدة إلى المجموع
+    words = tail.split()
+    if len(words) >= 12:
+        unique_ratio = len(set(words)) / len(words)
+        if unique_ratio < 0.18:
+            return True
+
+    # (ب) تكرار كلمة واحدة متتالياً
+    if len(words) >= 8:
+        streak, longest = 1, 1
+        for i in range(1, len(words)):
+            streak = streak + 1 if words[i] == words[i - 1] else 1
+            longest = max(longest, streak)
+        if longest >= 6:
+            return True
+
+    # (ج) تكرار محرف واحد بكثافة (حالة الانهيار إلى لغة أخرى)
+    if len(tail) >= 60:
+        most_common = max((tail.count(ch) for ch in set(tail)), default=0)
+        if most_common > len(tail) * 0.30:
+            return True
+
+    return False
+
 
 def looks_corrupted(text: str) -> bool:
     """

@@ -22,6 +22,9 @@ data/*.csv.gz
 artifacts/*
 !artifacts/.gitkeep
 
+# سجلّ الملفات المرفوعة من الواجهة (خاص بكل بيئة)
+data/_uploads_registry.json
+
 chroma_db/*
 !chroma_db/.gitkeep
 

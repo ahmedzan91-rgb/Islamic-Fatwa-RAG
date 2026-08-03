@@ -220,6 +220,11 @@ def build_vector_store(
     model = get_embedding_model(embedding_config)
     LOGGER.info("نموذج التضمين: %s", model.info())
 
+    # واجهة TF-IDF تتطلب تدريباً على المتن قبل الفهرسة، وإلا فالمتجهات بلا معنى.
+    if model.needs_fitting():
+        LOGGER.info("تدريب مُضمِّن TF-IDF على متن الفتاوى قبل الفهرسة...")
+        model.fit_if_needed(chunks_df["text"].astype(str).tolist())
+
     client = get_chroma_client(config.persist_directory)
     collection = get_or_create_collection(client, config)
 

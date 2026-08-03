@@ -4,12 +4,11 @@ streamlit_app.py
 ================
 واجهة المستخدم التفاعلية لنظام الـ RAG الإسلامي للإجابة على الفتاوى والمسائل الشرعية.
 
-تربط هذه الواجهة كل المراحل السابقة (01 → 07) في تطبيق واحد:
-    - لوحة جانبية لضبط معاملات الاسترجاع والتوليد.
-    - محادثة تفاعلية مع بثّ الإجابة تدريجياً.
-    - عرض المصادر الشرعية المستشهد بها مع درجات التطابق.
-    - أدوات بناء الفهرس مباشرة من الواجهة (للتشغيل المحلي).
-    - مؤشر التأصيل (Groundedness) لضمان الشفافية الأكاديمية.
+تربط هذه الواجهة كل المراحل (01 → 08) في تطبيق واحد:
+    💬 المحادثة   — سؤال وجواب مؤصَّل بالمصادر مع بثّ تدريجي
+    📤 البيانات   — رفع ملفات الفتاوى وحفظها وبناء الفهرس
+    📚 المصادر    — عرض الفتاوى المستشهد بها ودرجات التطابق
+    ℹ️ عن النظام  — المعمارية والتشخيص
 
 التشغيل:
     streamlit run streamlit_app.py
@@ -21,6 +20,7 @@ streamlit_app.py
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -29,9 +29,10 @@ from typing import Any, Dict, List, Optional
 import streamlit as st
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
 
 # ----------------------------------------------------------------------------- #
-#                            إعداد الصفحة (يجب أن يسبق أي أمر st)                 #
+#                    إعداد الصفحة (يجب أن يسبق أي أمر st آخر)                     #
 # ----------------------------------------------------------------------------- #
 
 st.set_page_config(
@@ -49,7 +50,7 @@ st.set_page_config(
 OPENROUTER_API_KEY: str = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL: str = os.environ.get("OPENROUTER_MODEL", "")
 
-# الآلية المطلوبة في مواصفات المشروع لقراءة المفتاح بأمان على Streamlit Cloud
+# الآلية المعتمدة لقراءة المفتاح بأمان على Streamlit Cloud
 try:
     if not OPENROUTER_API_KEY:
         OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
@@ -60,14 +61,14 @@ except Exception:
 if not OPENROUTER_MODEL:
     OPENROUTER_MODEL = "openai/gpt-4o-mini"
 
-# نمرّر القيم إلى البيئة كي تلتقطها الوحدة 07 عند استيرادها
+# تمرير القيم إلى البيئة كي تلتقطها الوحدة 07
 if OPENROUTER_API_KEY:
     os.environ["OPENROUTER_API_KEY"] = OPENROUTER_API_KEY
 os.environ["OPENROUTER_MODEL"] = OPENROUTER_MODEL
 
 
 # ----------------------------------------------------------------------------- #
-#                     تحميل الوحدات المرقّمة (01 → 07)                            #
+#                     تحميل الوحدات المرقّمة (01 → 08)                            #
 # ----------------------------------------------------------------------------- #
 
 def load_numbered_module(filename: str, alias: str):
@@ -89,7 +90,7 @@ def load_numbered_module(filename: str, alias: str):
 
 @st.cache_resource(show_spinner="⏳ جارٍ تحميل وحدات النظام...")
 def load_pipeline_modules() -> Dict[str, Any]:
-    """تحميل كل وحدات خط الأنابيب مرة واحدة وتخزينها في الذاكرة المؤقتة."""
+    """تحميل كل وحدات خط الأنابيب مرة واحدة."""
     return {
         "documents": load_numbered_module("01_documents.py", "documents"),
         "preprocessing": load_numbered_module("02_preprocessing.py", "preprocessing"),
@@ -98,19 +99,17 @@ def load_pipeline_modules() -> Dict[str, Any]:
         "store": load_numbered_module("05_create_chroma_store.py", "create_chroma_store"),
         "retrieval": load_numbered_module("06_retrieve_context.py", "retrieve_context"),
         "prompting": load_numbered_module("07_prompting.py", "prompting"),
+        "data_manager": load_numbered_module("08_data_manager.py", "data_manager"),
     }
 
 
-@st.cache_resource(show_spinner="🧠 جارٍ تحميل نموذج التضمين العربي...")
-def get_cached_retriever(persist_dir: str, collection: str, top_k: int, threshold: float):
-    """إنشاء المسترجِع مرة واحدة (مكلف: يحمّل النموذج + يفتح قاعدة المتجهات)."""
+@st.cache_resource(show_spinner="🧠 جارٍ تهيئة محرّك البحث الدلالي...")
+def get_cached_retriever(persist_dir: str, collection: str, cache_key: int = 0):
+    """إنشاء المسترجِع مرة واحدة. cache_key يسمح بإبطال المخبأ بعد إعادة البناء."""
     modules = load_pipeline_modules()
     retrieval_module = modules["retrieval"]
     config = retrieval_module.RetrievalConfig(
-        persist_directory=persist_dir,
-        collection_name=collection,
-        top_k=top_k,
-        relevance_threshold=threshold,
+        persist_directory=persist_dir, collection_name=collection
     )
     return retrieval_module.FatwaRetriever(config)
 
@@ -124,9 +123,10 @@ CUSTOM_CSS = """
     @import url('https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Cairo:wght@300;400;600;700&display=swap');
 
     html, body, [class*="css"] { font-family: 'Cairo', 'Segoe UI', sans-serif; }
-    .main .block-container { direction: rtl; text-align: right; padding-top: 2rem; max-width: 1200px; }
+    .main .block-container { direction: rtl; text-align: right; padding-top: 2rem; max-width: 1250px; }
     section[data-testid="stSidebar"] { direction: rtl; text-align: right; }
     .stChatMessage { direction: rtl; text-align: right; }
+    div[data-testid="stFileUploader"] { direction: rtl; text-align: right; }
 
     .app-header {
         background: linear-gradient(135deg, #0f5132 0%, #1a7a4c 50%, #14532d 100%);
@@ -153,6 +153,7 @@ CUSTOM_CSS = """
     .badge-amber { background: #fef3c7; color: #92400e; }
     .badge-red   { background: #fee2e2; color: #991b1b; }
     .badge-blue  { background: #dbeafe; color: #1e40af; }
+    .badge-gray  { background: #f3f4f6; color: #374151; }
 
     .disclaimer {
         background: #fffbeb; border: 1px solid #fcd34d; border-radius: 10px;
@@ -164,7 +165,12 @@ CUSTOM_CSS = """
         padding: 1.4rem 1.6rem; line-height: 2.05; font-size: 1.02rem;
         direction: rtl; text-align: right;
     }
-    div[data-testid="stMetricValue"] { font-size: 1.4rem; }
+    .step-card {
+        background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 10px;
+        padding: 1rem 1.2rem; margin-bottom: .8rem;
+    }
+    .step-card h4 { margin: 0 0 .5rem 0; color: #0f5132; }
+    div[data-testid="stMetricValue"] { font-size: 1.35rem; }
     .stButton > button { width: 100%; border-radius: 8px; font-weight: 600; }
 </style>
 """
@@ -179,9 +185,11 @@ def init_session_state() -> None:
     defaults = {
         "messages": [],
         "last_sources": [],
-        "last_metrics": {},
         "index_built": False,
         "query_count": 0,
+        "retriever_cache_key": 0,
+        "upload_feedback": [],
+        "build_log": [],
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -189,6 +197,8 @@ def init_session_state() -> None:
 
 
 init_session_state()
+MODULES = load_pipeline_modules()
+DATA_MANAGER = MODULES["data_manager"]
 
 
 # ----------------------------------------------------------------------------- #
@@ -201,7 +211,7 @@ st.markdown(
         <h1>🕌 المُعين الشرعي</h1>
         <p>نظام استرجاع وتوليد معزّز (RAG) للإجابة على الفتاوى والمسائل الشرعية</p>
         <p style="font-size:.85rem; opacity:.8; margin-top:.5rem;">
-            مبني على قاعدة بيانات تضم أكثر من ١٣٩ ألف فتوى — مشروع أكاديمي
+            مبني على قاعدة فتاوى موثّقة — مشروع أكاديمي
         </p>
     </div>
     """,
@@ -216,36 +226,58 @@ st.markdown(
 with st.sidebar:
     st.header("⚙️ الإعدادات")
 
-    # --- حالة الاتصال ---
+    # ------------------------- حالة الاتصال ------------------------- #
     st.subheader("🔐 حالة الاتصال")
     if OPENROUTER_API_KEY:
-        masked = f"{OPENROUTER_API_KEY[:6]}{'*' * 8}{OPENROUTER_API_KEY[-4:]}" \
+        masked = (
+            f"{OPENROUTER_API_KEY[:6]}{'*' * 8}{OPENROUTER_API_KEY[-4:]}"
             if len(OPENROUTER_API_KEY) > 12 else "*" * len(OPENROUTER_API_KEY)
+        )
         st.success(f"✅ المفتاح مُهيَّأ\n\n`{masked}`")
     else:
         st.error("❌ لم يُعثر على `OPENROUTER_API_KEY`")
         with st.expander("كيف أضيف المفتاح؟"):
             st.markdown(
-                "**على Streamlit Cloud:** من `Settings → Secrets` أضف:\n"
+                "**على Streamlit Cloud:** `Settings → Secrets`\n"
                 "```toml\n"
                 'OPENROUTER_API_KEY = "sk-or-v1-..."\n'
                 'OPENROUTER_MODEL = "openai/gpt-4o-mini"\n'
                 "```\n"
-                "**محلياً:** أنشئ ملف `.streamlit/secrets.toml` بنفس المحتوى."
+                "**محلياً:** أنشئ `.streamlit/secrets.toml` بنفس المحتوى."
             )
 
     model_name = st.text_input(
-        "🤖 نموذج التوليد (OpenRouter)",
+        "🤖 نموذج التوليد",
         value=OPENROUTER_MODEL,
         help="مثال: openai/gpt-4o-mini أو meta-llama/llama-3.3-70b-instruct:free",
     )
 
     st.divider()
 
-    # --- إعدادات الاسترجاع ---
+    # ------------------------- محرّك التضمين ------------------------- #
+    st.subheader("🧠 محرّك التضمين")
+    try:
+        embedding_model = MODULES["vectors"].get_embedding_model()
+        info = embedding_model.info()
+        if info["is_neural"]:
+            st.success(f"عصبي · {info['dimension']} بُعد")
+            st.caption(f"`{info['model_name']}`")
+        else:
+            st.warning(f"لفظي (TF-IDF) · {info['dimension']} بُعد")
+            st.caption(
+                "المكتبات العصبية غير مثبّتة في هذه البيئة. "
+                "النظام يعمل بجودة مقبولة. للجودة الكاملة: "
+                "`pip install -r requirements-full.txt` محلياً."
+            )
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"تعذّر تهيئة محرّك التضمين: {exc}")
+        embedding_model = None
+
+    st.divider()
+
+    # ------------------------- معاملات الاسترجاع ------------------------- #
     st.subheader("🔍 معاملات الاسترجاع")
-    top_k = st.slider("عدد الفتاوى المسترجعة (Top-K)", 1, 15, 5,
-                      help="كلما زاد العدد اتّسع السياق وزادت التكلفة.")
+    top_k = st.slider("عدد الفتاوى المسترجعة", 1, 15, 5)
     threshold = st.slider("حدّ الثقة الأدنى", 0.0, 1.0, 0.28, 0.02,
                           help="إن لم تتجاوزه أي نتيجة، يمتنع النظام عن الإفتاء.")
     collection_name = st.text_input("اسم المجموعة", value="islamic_fatwas")
@@ -253,92 +285,287 @@ with st.sidebar:
 
     st.divider()
 
-    # --- إعدادات التوليد ---
+    # ------------------------- معاملات التوليد ------------------------- #
     st.subheader("🎛️ معاملات التوليد")
-    temperature = st.slider("درجة الحرارة (Temperature)", 0.0, 1.0, 0.2, 0.05,
-                            help="القيم المنخفضة أدقّ والتزاماً بالنص الشرعي.")
-    max_tokens = st.slider("أقصى طول للإجابة (توكن)", 300, 4000, 1400, 100)
+    temperature = st.slider("درجة الحرارة", 0.0, 1.0, 0.2, 0.05)
+    max_tokens = st.slider("أقصى طول للإجابة", 300, 4000, 1400, 100)
     use_streaming = st.checkbox("بثّ الإجابة تدريجياً", value=True)
-    show_context = st.checkbox("إظهار السياق الخام المُرسل للنموذج", value=False)
+    show_context = st.checkbox("إظهار السياق الخام", value=False)
 
     st.divider()
 
-    # --- حالة قاعدة المتجهات ---
+    # ------------------------- حالة الفهرس ------------------------- #
     st.subheader("🗄️ قاعدة المتجهات")
+    retriever = None
     try:
-        retriever = get_cached_retriever(persist_dir, collection_name, top_k, threshold)
+        retriever = get_cached_retriever(
+            persist_dir, collection_name, st.session_state.retriever_cache_key
+        )
         chunk_count = retriever.count()
         if chunk_count > 0:
-            st.success(f"✅ جاهزة — {chunk_count:,} جزء مفهرس")
+            st.success(f"✅ جاهزة — {chunk_count:,} جزء")
             st.session_state.index_built = True
         else:
-            st.warning("⚠️ المجموعة فارغة — شغّل مراحل البناء أولاً.")
+            st.warning("⚠️ فارغة — ارفع بيانات وابنِ الفهرس من تبويب «البيانات».")
             st.session_state.index_built = False
     except Exception as exc:  # noqa: BLE001
-        st.error(f"تعذّر فتح قاعدة المتجهات:\n\n`{exc}`")
-        retriever = None
+        st.error(f"تعذّر فتح القاعدة:\n\n`{exc}`")
         st.session_state.index_built = False
-
-    with st.expander("🏗️ بناء الفهرس (تشغيل محلي)"):
-        st.caption("ينفّذ المراحل 01 → 05 على ملفات CSV في مجلد `data/`.")
-        build_limit = st.number_input("حدّ الفتاوى (0 = الكل)", 0, 200_000, 2000, 500)
-        chunk_size = st.number_input("حجم الجزء (محرف)", 300, 2000, 900, 50)
-        chunk_overlap = st.number_input("التراكب (محرف)", 0, 500, 150, 25)
-        if st.button("🚀 ابدأ بناء الفهرس"):
-            modules = load_pipeline_modules()
-            progress = st.progress(0.0, text="المرحلة 1/4: قراءة ملفات CSV...")
-            try:
-                docs_module = modules["documents"]
-                data_dir = os.path.join(BASE_DIR, "data")
-                documents = docs_module.load_documents(
-                    data_dir,
-                    max_rows_per_file=int(build_limit) or None,
-                )
-                if documents.empty:
-                    st.error("لم يُعثر على بيانات في مجلد `data/`.")
-                else:
-                    progress.progress(0.25, text="المرحلة 2/4: تنظيف النصوص...")
-                    cleaned = modules["preprocessing"].preprocess_documents(documents)
-
-                    progress.progress(0.5, text="المرحلة 3/4: تقطيع النصوص...")
-                    chunk_config = modules["chunking"].ChunkConfig(
-                        chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap)
-                    )
-                    chunks = modules["chunking"].chunk_documents(cleaned, chunk_config)
-
-                    progress.progress(0.7, text="المرحلة 4/4: بناء قاعدة المتجهات...")
-                    store_config = modules["store"].ChromaConfig(
-                        persist_directory=persist_dir, collection_name=collection_name
-                    )
-                    modules["store"].build_vector_store(chunks, store_config)
-
-                    progress.progress(1.0, text="اكتمل البناء ✅")
-                    st.success(f"تمت فهرسة {len(chunks):,} جزء من {len(cleaned):,} فتوى.")
-                    st.cache_resource.clear()
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"فشل البناء: {exc}")
 
     st.divider()
     if st.button("🗑️ مسح المحادثة"):
         st.session_state.messages = []
         st.session_state.last_sources = []
-        st.session_state.last_metrics = {}
         st.rerun()
 
-    st.caption(f"عدد الاستعلامات في هذه الجلسة: {st.session_state.query_count}")
+    st.caption(f"الاستعلامات في هذه الجلسة: {st.session_state.query_count}")
 
 
 # ----------------------------------------------------------------------------- #
 #                              التبويبات الرئيسية                                 #
 # ----------------------------------------------------------------------------- #
 
-tab_chat, tab_sources, tab_about = st.tabs(["💬 المحادثة", "📚 المصادر", "ℹ️ عن النظام"])
+tab_chat, tab_data, tab_sources, tab_about = st.tabs(
+    ["💬 المحادثة", "📤 البيانات والفهرسة", "📚 المصادر", "ℹ️ عن النظام"]
+)
 
 
-# ------------------------------ تبويب المحادثة ------------------------------- #
+# ═══════════════════════════ تبويب البيانات ═══════════════════════════ #
+
+with tab_data:
+    st.subheader("📤 رفع ملفات الفتاوى وبناء الفهرس")
+
+    # تنبيه الديمومة حسب البيئة
+    level, note = DATA_MANAGER.persistence_note()
+    (st.warning if level == "warning" else st.success)(note)
+
+    st.markdown("---")
+
+    # ─────────────────── الخطوة 1: الرفع ─────────────────── #
+    st.markdown("#### 1️⃣ رفع الملفات")
+
+    uploaded_files = st.file_uploader(
+        "اختر ملفات الفتاوى",
+        type=["csv", "tsv", "txt", "xlsx", "xls", "zip"],
+        accept_multiple_files=True,
+        help=(
+            "الصيغ المدعومة: CSV · TSV · Excel · ZIP (يُفكّ تلقائياً). "
+            "الحد الأقصى 500 ميجابايت للملف. "
+            "الترميز العربي (utf-8 / windows-1256) يُكتشف تلقائياً."
+        ),
+    )
+
+    col_upload, col_validate = st.columns([1, 1])
+    with col_upload:
+        do_validate = st.checkbox("فحص الأعمدة قبل الحفظ", value=True)
+    with col_validate:
+        save_clicked = st.button("💾 حفظ الملفات المرفوعة", type="primary")
+
+    if save_clicked:
+        if not uploaded_files:
+            st.warning("لم تختر أي ملف بعد.")
+        else:
+            documents_module = MODULES["documents"]
+            aliases = getattr(documents_module, "COLUMN_ALIASES", None)
+            feedback: List[tuple] = []
+
+            progress = st.progress(0.0, text="جارٍ الحفظ...")
+            for i, uploaded in enumerate(uploaded_files, start=1):
+                progress.progress(
+                    i / len(uploaded_files), text=f"معالجة: {uploaded.name}"
+                )
+                try:
+                    payload = uploaded.getvalue()
+                    ok, message, info = DATA_MANAGER.save_uploaded_bytes(
+                        data=payload,
+                        filename=uploaded.name,
+                        data_dir=DATA_DIR,
+                        validate=do_validate,
+                        column_aliases=aliases,
+                    )
+                    feedback.append((ok, uploaded.name, message, info))
+                except Exception as exc:  # noqa: BLE001
+                    feedback.append((False, uploaded.name, f"خطأ: {exc}", None))
+
+            progress.empty()
+            st.session_state.upload_feedback = [
+                (ok, name, msg) for ok, name, msg, _ in feedback
+            ]
+
+            succeeded = sum(1 for ok, *_ in feedback if ok)
+            if succeeded:
+                st.success(f"✅ حُفظ {succeeded} من {len(feedback)} ملف.")
+            for ok, name, message, info in feedback:
+                if ok:
+                    detail = ""
+                    if info and info.rows:
+                        detail = f" — ~{info.rows:,} صف · ترميز {info.detected_encoding}"
+                    st.success(f"**{name}**: {message}{detail}")
+                else:
+                    st.error(f"**{name}**: {message}")
+
+    # معاينة الملفات قبل الحفظ
+    if uploaded_files and not save_clicked:
+        with st.expander(f"🔎 معاينة الملفات المختارة ({len(uploaded_files)})"):
+            documents_module = MODULES["documents"]
+            aliases = getattr(documents_module, "COLUMN_ALIASES", None)
+            for uploaded in uploaded_files[:5]:
+                st.markdown(f"**📄 {uploaded.name}** — {DATA_MANAGER.human_size(uploaded.size)}")
+                if uploaded.name.lower().endswith(".zip"):
+                    st.caption("أرشيف مضغوط — سيُفكّ عند الحفظ.")
+                    continue
+                try:
+                    result = DATA_MANAGER.validate_tabular_bytes(
+                        uploaded.getvalue(), uploaded.name, aliases
+                    )
+                    if result.is_valid:
+                        st.caption(
+                            f"✅ صالح · ~{result.rows:,} صف · ترميز `{result.encoding}` · "
+                            f"{len(result.columns)} عمود"
+                        )
+                        if result.mapped_columns:
+                            mapped = " · ".join(
+                                f"`{k}` → **{v}**" for k, v in result.mapped_columns.items()
+                            )
+                            st.caption(f"الأعمدة المتعرّف عليها: {mapped}")
+                        for warning in result.warnings:
+                            st.caption(f"⚠️ {warning}")
+                        if result.preview is not None:
+                            st.dataframe(result.preview, use_container_width=True, height=180)
+                    else:
+                        st.error(" | ".join(result.errors))
+                        st.caption(f"الأعمدة الموجودة: {', '.join(result.columns[:15])}")
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"تعذّرت المعاينة: {exc}")
+                st.markdown("---")
+
+    st.markdown("---")
+
+    # ─────────────────── الخطوة 2: الملفات المحفوظة ─────────────────── #
+    st.markdown("#### 2️⃣ الملفات المحفوظة")
+
+    data_files = DATA_MANAGER.list_data_files(DATA_DIR)
+    stats = DATA_MANAGER.data_directory_stats(DATA_DIR)
+
+    stat_cols = st.columns(3)
+    stat_cols[0].metric("📁 عدد الملفات", stats["files"])
+    stat_cols[1].metric("💾 الحجم الكلي", stats["total_size"])
+    stat_cols[2].metric(
+        "📊 الصفوف التقديرية",
+        f"{stats['estimated_rows']:,}" if stats["estimated_rows"] else "—",
+    )
+
+    if not data_files:
+        st.info("لا توجد ملفات بعد. ارفع ملفات CSV من الأعلى، أو ضعها في مجلد `data/` بالمستودع.")
+    else:
+        display_rows = [
+            {k: v for k, v in row.items() if not k.startswith("_")} for row in data_files
+        ]
+        st.dataframe(display_rows, use_container_width=True, hide_index=True)
+
+        with st.expander("🗑️ حذف ملف"):
+            names = [row["الملف"] for row in data_files]
+            to_delete = st.selectbox("اختر الملف", names, key="delete_select")
+            if st.button("تأكيد الحذف", key="delete_btn"):
+                target = next(r for r in data_files if r["الملف"] == to_delete)
+                ok, message = DATA_MANAGER.delete_data_file(target["_path"], DATA_DIR)
+                (st.success if ok else st.error)(message)
+                st.rerun()
+
+    st.markdown("---")
+
+    # ─────────────────── الخطوة 3: بناء الفهرس ─────────────────── #
+    st.markdown("#### 3️⃣ بناء الفهرس")
+    st.caption("ينفّذ المراحل 01 → 05: القراءة ← التنظيف ← التقطيع ← التضمين ← الفهرسة.")
+
+    build_cols = st.columns(3)
+    with build_cols[0]:
+        build_limit = st.number_input(
+            "حدّ الفتاوى لكل ملف (0 = الكل)", 0, 500_000, 2000, 500,
+            help="ابدأ برقم صغير للتأكد من تطابق الأعمدة قبل البناء الكامل.",
+        )
+    with build_cols[1]:
+        chunk_size = st.number_input("حجم الجزء (محرف)", 300, 2000, 900, 50)
+    with build_cols[2]:
+        chunk_overlap = st.number_input("التراكب (محرف)", 0, 500, 150, 25)
+
+    reset_index = st.checkbox(
+        "حذف الفهرس الحالي قبل البناء", value=False,
+        help="فعّلها عند تغيير البيانات جذرياً. بدونها تُضاف الفتاوى الجديدة للفهرس الموجود.",
+    )
+
+    if st.button("🚀 ابدأ بناء الفهرس", type="primary", disabled=not data_files):
+        status = st.status("جارٍ بناء الفهرس...", expanded=True)
+        try:
+            # المرحلة 1
+            status.write("**1/5** — قراءة ملفات CSV...")
+            documents = MODULES["documents"].load_documents(
+                DATA_DIR, max_rows_per_file=int(build_limit) or None
+            )
+            if documents.empty:
+                status.update(label="فشل البناء", state="error")
+                st.error(
+                    "لم يُعثر على بيانات صالحة. تحقّق من أن ملفاتك تحتوي عمود "
+                    "الجواب/نص الفتوى، أو أضِف أسماء أعمدتك إلى `COLUMN_ALIASES`."
+                )
+            else:
+                status.write(f"✅ حُمّلت {len(documents):,} فتوى")
+
+                # المرحلة 2
+                status.write("**2/5** — تنظيف النصوص الشرعية...")
+                cleaned = MODULES["preprocessing"].preprocess_documents(documents)
+                status.write(f"✅ بقيت {len(cleaned):,} فتوى بعد التنظيف")
+
+                # المرحلة 3
+                status.write("**3/5** — تقطيع النصوص...")
+                chunk_config = MODULES["chunking"].ChunkConfig(
+                    chunk_size=int(chunk_size), chunk_overlap=int(chunk_overlap)
+                )
+                chunks = MODULES["chunking"].chunk_documents(cleaned, chunk_config)
+                status.write(f"✅ أُنتج {len(chunks):,} جزء")
+
+                # المرحلة 4
+                status.write("**4/5** — تهيئة محرّك التضمين...")
+                model = MODULES["vectors"].get_embedding_model()
+                if model.needs_fitting():
+                    status.write("↳ تدريب مُضمِّن TF-IDF على المتن...")
+                status.write(f"✅ {model.quality_note()}")
+
+                # المرحلة 5
+                status.write("**5/5** — بناء قاعدة المتجهات (قد يستغرق وقتاً)...")
+                store_config = MODULES["store"].ChromaConfig(
+                    persist_directory=persist_dir,
+                    collection_name=collection_name,
+                    reset_collection=reset_index,
+                )
+                collection = MODULES["store"].build_vector_store(chunks, store_config)
+                indexed = collection.count()
+
+                status.update(label=f"✅ اكتمل البناء — {indexed:,} جزء مفهرس", state="complete")
+                st.success(
+                    f"تمت فهرسة **{indexed:,}** جزء من **{len(cleaned):,}** فتوى. "
+                    "انتقل إلى تبويب المحادثة لطرح أسئلتك."
+                )
+                st.balloons()
+
+                # إبطال المخبأ ليلتقط الفهرس الجديد
+                st.session_state.retriever_cache_key += 1
+                get_cached_retriever.clear()
+
+        except Exception as exc:  # noqa: BLE001
+            status.update(label="فشل البناء", state="error")
+            st.error(f"حدث خطأ أثناء البناء: {exc}")
+            with st.expander("تفاصيل تقنية"):
+                import traceback
+                st.code(traceback.format_exc())
+
+    if not data_files:
+        st.caption("⬆️ ارفع ملفات أولاً لتفعيل زر البناء.")
+
+
+# ═══════════════════════════ تبويب المحادثة ═══════════════════════════ #
 
 with tab_chat:
-    # أمثلة جاهزة
     st.markdown("**أسئلة مقترحة للتجربة:**")
     example_cols = st.columns(3)
     examples = [
@@ -354,11 +581,10 @@ with tab_chat:
 
     st.divider()
 
-    # عرض تاريخ المحادثة
     for message in st.session_state.messages:
         avatar = "🕌" if message["role"] == "assistant" else "🧑"
         with st.chat_message(message["role"], avatar=avatar):
-            st.markdown(message["content"], unsafe_allow_html=False)
+            st.markdown(message["content"])
 
     user_question = st.chat_input("اكتب سؤالك الشرعي هنا...") or clicked_example
 
@@ -371,14 +597,13 @@ with tab_chat:
         with st.chat_message("assistant", avatar="🕌"):
             if not st.session_state.index_built or retriever is None:
                 st.error(
-                    "⚠️ قاعدة المتجهات غير جاهزة. الرجاء بناء الفهرس أولاً "
-                    "من اللوحة الجانبية أو بتشغيل الملفات `01` إلى `05`."
+                    "⚠️ قاعدة المتجهات غير جاهزة. انتقل إلى تبويب "
+                    "**📤 البيانات والفهرسة** لرفع ملفات الفتاوى وبناء الفهرس."
                 )
             elif not OPENROUTER_API_KEY:
                 st.error("⚠️ مفتاح `OPENROUTER_API_KEY` غير مُهيَّأ — راجع اللوحة الجانبية.")
             else:
-                modules = load_pipeline_modules()
-                prompting = modules["prompting"]
+                prompting = MODULES["prompting"]
 
                 # 1) الاسترجاع
                 with st.spinner("🔍 جارٍ البحث في قاعدة الفتاوى..."):
@@ -393,8 +618,8 @@ with tab_chat:
                 if not retrieval.has_sufficient_context:
                     st.warning(
                         f"⚠️ لم يُعثر على فتاوى ذات صلة كافية "
-                        f"(أعلى درجة تطابق: {retrieval.max_score:.3f} < {threshold:.2f}). "
-                        "سيتم إبلاغك بذلك دون إصدار حكم."
+                        f"(أعلى تطابق {retrieval.max_score:.3f} < {threshold:.2f}). "
+                        "سيُبلَّغ بذلك دون إصدار حكم."
                     )
 
                 if show_context and retrieval.context:
@@ -415,27 +640,25 @@ with tab_chat:
 
                 # 3) التوليد
                 generation_config = prompting.GenerationConfig(
-                    model=model_name,
-                    temperature=temperature,
-                    max_tokens=int(max_tokens),
+                    model=model_name, temperature=temperature, max_tokens=int(max_tokens)
                 )
                 client = prompting.OpenRouterClient(generation_config)
 
                 generation_started = time.time()
+                total_tokens = 0
                 if use_streaming:
                     placeholder = st.empty()
-                    answer_parts: List[str] = []
+                    parts: List[str] = []
                     for token in client.chat_stream(messages):
-                        answer_parts.append(token)
+                        parts.append(token)
                         placeholder.markdown(
-                            f'<div class="answer-box">{"".join(answer_parts)}▌</div>',
+                            f'<div class="answer-box">{"".join(parts)}▌</div>',
                             unsafe_allow_html=True,
                         )
-                    answer = "".join(answer_parts).strip()
+                    answer = "".join(parts).strip()
                     placeholder.markdown(
                         f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True
                     )
-                    total_tokens = 0
                 else:
                     with st.spinner("✍️ جارٍ صياغة الإجابة..."):
                         result = client.chat(messages)
@@ -447,15 +670,6 @@ with tab_chat:
 
                 # 4) مؤشرات الجودة
                 grounded = prompting.verify_groundedness(answer, len(retrieval.chunks))
-                st.session_state.last_metrics = {
-                    "retrieval_time": retrieval_time,
-                    "generation_time": generation_time,
-                    "chunks": len(retrieval.chunks),
-                    "max_score": retrieval.max_score,
-                    "grounded": grounded,
-                    "tokens": total_tokens,
-                }
-
                 metric_cols = st.columns(4)
                 metric_cols[0].metric("⏱️ الاسترجاع", f"{retrieval_time:.2f}s")
                 metric_cols[1].metric("✍️ التوليد", f"{generation_time:.2f}s")
@@ -469,7 +683,7 @@ with tab_chat:
                     )
                 elif retrieval.has_sufficient_context:
                     st.markdown(
-                        '<span class="badge badge-amber">⚠ لم تُرصد إحالات صريحة للمصادر</span>',
+                        '<span class="badge badge-amber">⚠ لم تُرصد إحالات صريحة</span>',
                         unsafe_allow_html=True,
                     )
 
@@ -483,7 +697,7 @@ with tab_chat:
                 st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
-# ------------------------------ تبويب المصادر -------------------------------- #
+# ═══════════════════════════ تبويب المصادر ═══════════════════════════ #
 
 with tab_sources:
     st.subheader("📚 المصادر الشرعية المسترجعة للسؤال الأخير")
@@ -497,10 +711,9 @@ with tab_sources:
                 else "badge-amber" if chunk.final_score >= 0.35
                 else "badge-red"
             )
+            title = chunk.title[:80] or f"فتوى رقم {chunk.fatwa_id}"
             with st.expander(
-                f"[مصدر {i}] {chunk.title[:80] or 'فتوى رقم ' + str(chunk.fatwa_id)} "
-                f"— تطابق {chunk.final_score:.3f}",
-                expanded=(i == 1),
+                f"[مصدر {i}] {title} — تطابق {chunk.final_score:.3f}", expanded=(i == 1)
             ):
                 st.markdown(
                     f"""
@@ -508,8 +721,8 @@ with tab_sources:
                         <div class="meta">
                             <span class="badge badge-blue">رقم الفتوى: {chunk.fatwa_id}</span>
                             <span class="badge {score_class}">التطابق: {chunk.final_score:.3f}</span>
-                            <span class="badge badge-blue">دلالي: {chunk.semantic_score:.3f}</span>
-                            <span class="badge badge-blue">لفظي: {chunk.lexical_score:.3f}</span>
+                            <span class="badge badge-gray">دلالي: {chunk.semantic_score:.3f}</span>
+                            <span class="badge badge-gray">لفظي: {chunk.lexical_score:.3f}</span>
                             <br/><br/>
                             <b>المصدر:</b> {chunk.source or '—'} &nbsp;|&nbsp;
                             <b>التصنيف:</b> {chunk.category or '—'} &nbsp;|&nbsp;
@@ -525,69 +738,76 @@ with tab_sources:
                 if chunk.url:
                     st.markdown(f"🔗 [الرابط الأصلي للفتوى]({chunk.url})")
 
-        # تنزيل المصادر
-        import json as _json
         st.download_button(
             "⬇️ تنزيل المصادر (JSON)",
-            data=_json.dumps([c.to_dict() for c in sources], ensure_ascii=False, indent=2),
+            data=json.dumps([c.to_dict() for c in sources], ensure_ascii=False, indent=2),
             file_name="fatwa_sources.json",
             mime="application/json",
         )
 
 
-# ------------------------------ تبويب عن النظام ------------------------------- #
+# ═══════════════════════════ تبويب عن النظام ═══════════════════════════ #
 
 with tab_about:
     st.subheader("ℹ️ عن النظام والمعمارية")
 
     st.markdown(
         """
-        ### 🏗️ معمارية خط الأنابيب (RAG Pipeline)
+        ### 🏗️ خط الأنابيب (RAG Pipeline)
 
         | المرحلة | الملف | الوظيفة |
         |---|---|---|
         | 1 | `01_documents.py` | قراءة ملفات الفتاوى (CSV) وتوحيد المخطط |
         | 2 | `02_preprocessing.py` | تنظيف النصوص وتطبيع العربية وحذف التكرار |
         | 3 | `03_chunking.py` | تقطيع هرمي يحترم الجُمل مع حفظ الـ metadata |
-        | 4 | `04_vector_representation.py` | نموذج التضمين العربي (multilingual-e5) |
+        | 4 | `04_vector_representation.py` | التضمين المتكيّف (عصبي / TF-IDF) |
         | 5 | `05_create_chroma_store.py` | بناء قاعدة المتجهات ChromaDB |
         | 6 | `06_retrieve_context.py` | استرجاع متعدد المراحل مع إعادة ترتيب |
         | 7 | `07_prompting.py` | البرومبت المحكم + OpenRouter API |
-        | 8 | `streamlit_app.py` | واجهة المستخدم التفاعلية |
+        | 8 | `08_data_manager.py` | إدارة رفع الملفات وحفظها |
 
         ### 🛡️ ضوابط السلامة الشرعية
         - **التقيّد بالسياق:** يُمنع النموذج من الإفتاء من معرفته الداخلية.
         - **الإحالة الإلزامية:** كل حكم منسوب إلى `[مصدر ن]` مع رقم الفتوى.
         - **الامتناع عند الجهل:** حدّ ثقة أدنى يمنع التأليف عند غياب السند.
         - **التحقق البعدي:** مؤشر التأصيل يفحص وجود الإحالات في الإجابة.
-
-        ### 🔐 إدارة المفاتيح
-        لا يوجد أي مفتاح مكتوب في الشيفرة. تُقرأ القيم من `st.secrets` أو متغيرات البيئة:
-        ```toml
-        # .streamlit/secrets.toml
-        OPENROUTER_API_KEY = "sk-or-v1-xxxxxxxx"
-        OPENROUTER_MODEL   = "openai/gpt-4o-mini"
-        ```
         """
     )
 
     st.divider()
-    modules_loaded = "pipeline" in str(st.session_state)
-    info_cols = st.columns(3)
-    info_cols[0].metric("📄 المراحل", "7 + واجهة")
-    info_cols[1].metric("🗄️ قاعدة المتجهات", "ChromaDB")
-    info_cols[2].metric("🤖 مزوّد النموذج", "OpenRouter")
+    st.markdown("### 🧪 تشخيص البيئة")
 
-    with st.expander("🧪 تشخيص البيئة"):
+    diag_cols = st.columns(2)
+    with diag_cols[0]:
+        st.markdown("**محرّك التضمين**")
         try:
-            modules = load_pipeline_modules()
-            model = modules["vectors"].get_embedding_model()
-            st.json(model.info())
+            st.json(MODULES["vectors"].get_embedding_model().info())
         except Exception as exc:  # noqa: BLE001
-            st.error(f"تعذّر تحميل نموذج التضمين: {exc}")
-        st.write("**مسار قاعدة المتجهات:**", persist_dir)
-        st.write("**المجموعة:**", collection_name)
-        st.write("**النموذج التوليدي:**", model_name)
+            st.error(str(exc))
+    with diag_cols[1]:
+        st.markdown("**البيئة**")
+        st.json({
+            "python": sys.version.split()[0],
+            "بيئة مؤقتة": DATA_MANAGER.is_ephemeral_environment(),
+            "مسار البيانات": DATA_DIR,
+            "مسار الفهرس": persist_dir,
+            "المجموعة": collection_name,
+            "النموذج التوليدي": model_name,
+        })
+
+    with st.expander("📦 المكتبات المثبّتة"):
+        for package in ["streamlit", "pandas", "numpy", "chromadb",
+                        "sklearn", "torch", "sentence_transformers"]:
+            spec = importlib.util.find_spec(package)
+            if spec:
+                try:
+                    module = importlib.import_module(package)
+                    version = getattr(module, "__version__", "—")
+                    st.markdown(f"✅ `{package}` — {version}")
+                except Exception:  # noqa: BLE001
+                    st.markdown(f"✅ `{package}`")
+            else:
+                st.markdown(f"➖ `{package}` — غير مثبّتة")
 
 
 # ----------------------------------------------------------------------------- #
@@ -599,9 +819,7 @@ st.markdown(
     <hr style="margin-top:2.5rem; opacity:.25;"/>
     <div style="text-align:center; color:#6b7280; font-size:.85rem; padding-bottom:1.5rem;">
         🕌 المُعين الشرعي — نظام RAG للفتاوى الإسلامية | مشروع أكاديمي<br/>
-        <span style="font-size:.78rem;">
-            وَقُل رَّبِّ زِدْنِي عِلْمًا — والله تعالى أعلم
-        </span>
+        <span style="font-size:.78rem;">وَقُل رَّبِّ زِدْنِي عِلْمًا — والله تعالى أعلم</span>
     </div>
     """,
     unsafe_allow_html=True,

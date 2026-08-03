@@ -324,6 +324,10 @@ class OpenRouterClient:
                     timeout=self.config.timeout,
                 )
 
+                # ضمان فكّ UTF-8: بعض الاستجابات تأتي بلا charset فيفترض
+                # requests ترميز latin-1 ويشوّه النص العربي.
+                response.encoding = "utf-8"
+
                 if response.status_code == 200:
                     data = response.json()
                     choice = (data.get("choices") or [{}])[0]
@@ -341,7 +345,7 @@ class OpenRouterClient:
                     )
 
                 if response.status_code in (429, 500, 502, 503, 504):
-                    last_error = f"خطأ مؤقت {response.status_code}: {response.text[:200]}"
+                    last_error = f"خطأ مؤقت {response.status_code}: {response.text[:200]}"  # response.encoding مضبوط أعلاه
                     wait = self.config.retry_backoff ** attempt
                     LOGGER.warning("%s — إعادة المحاولة بعد %.1f ثانية.", last_error, wait)
                     time.sleep(wait)
@@ -404,23 +408,39 @@ class OpenRouterClient:
                 stream=True,
             ) as response:
                 if response.status_code != 200:
+                    response.encoding = "utf-8"
                     yield f"⚠️ خطأ {response.status_code}: {response.text[:200]}"
                     return
 
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data: "):
+                # ── حاسم للعربية ──
+                # لا نستخدم decode_unicode=True لأن requests يفترض latin-1
+                # عند غياب charset من ترويسة SSE (وفق RFC 2616)، فيشوّه
+                # كل حرف عربي: "الخلاصة" تصبح "Ø§ÙØ®ÙØ§ØµØ©".
+                # نقرأ البايتات الخام ونفكّها بـ UTF-8 صراحةً، مع مخزن مؤقت
+                # يحمي المحارف متعددة البايتات من البتر على حدود الدفعات.
+                buffer = b""
+                for raw_chunk in response.iter_content(chunk_size=None):
+                    if not raw_chunk:
                         continue
-                    chunk = line[6:]
-                    if chunk.strip() == "[DONE]":
-                        break
-                    try:
-                        data = json.loads(chunk)
-                        delta = (data.get("choices") or [{}])[0].get("delta") or {}
-                        content = delta.get("content")
-                        if content:
-                            yield content
-                    except json.JSONDecodeError:
-                        continue
+                    buffer += raw_chunk
+
+                    while b"\n" in buffer:
+                        raw_line, buffer = buffer.split(b"\n", 1)
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+
+                        if not line or not line.startswith("data: "):
+                            continue
+                        chunk = line[6:]
+                        if chunk.strip() == "[DONE]":
+                            return
+                        try:
+                            data = json.loads(chunk)
+                            delta = (data.get("choices") or [{}])[0].get("delta") or {}
+                            content = delta.get("content")
+                            if content:
+                                yield content
+                        except json.JSONDecodeError:
+                            continue
         except Exception as exc:  # noqa: BLE001
             yield f"\n\n⚠️ انقطع البثّ: {exc}"
 
@@ -430,6 +450,7 @@ class OpenRouterClient:
             response = requests.get(OPENROUTER_MODELS_ENDPOINT, timeout=20)
             if response.status_code != 200:
                 return []
+            response.encoding = "utf-8"
             models = response.json().get("data", [])
             return sorted(m["id"] for m in models if str(m.get("id", "")).endswith(":free"))
         except Exception:  # noqa: BLE001
@@ -439,6 +460,23 @@ class OpenRouterClient:
 # ----------------------------------------------------------------------------- #
 #                            التحقق من التأصيل                                    #
 # ----------------------------------------------------------------------------- #
+
+def looks_corrupted(text: str) -> bool:
+    """
+    فحص أخير قبل عرض الإجابة: هل هي مشوّهة (موجابيك)؟
+
+    خطّ دفاع أخير. حتى بعد ضبط الترميز، قد يعيد مزوّد أو وسيط نصاً تالفاً.
+    عرض نص غير مقروء أسوأ من رسالة خطأ صريحة، خاصة في سياق شرعي
+    قد يُساء فيه فهم كلمة مشوّهة.
+    """
+    if not text or len(text) < 30:
+        return False
+    sample = text[:1500]
+    latin_ext = sum(1 for ch in sample if ch in "ØÙÚÛÃÂÐÑðŸ™Œ")
+    arabic = sum(1 for ch in sample if "\u0600" <= ch <= "\u06FF")
+    # نص فيه كثافة عالية من اللاتينية الممدودة ولا عربية تُذكر = مشوّه
+    return latin_ext > 15 and arabic < len(sample) * 0.10
+
 
 def verify_groundedness(answer: str, num_sources: int) -> bool:
     """

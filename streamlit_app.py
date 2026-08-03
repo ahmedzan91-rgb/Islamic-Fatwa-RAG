@@ -755,7 +755,19 @@ with tab_chat:
 
                 generation_time = time.time() - generation_started
 
-                # 4) مؤشرات الجودة
+                # 4) حارس التشويه: نمنع عرض إجابة غير مقروءة
+                if getattr(prompting, "looks_corrupted", lambda _: False)(answer):
+                    st.error(
+                        "⚠️ **الإجابة وصلت مشوّهة (خطأ ترميز).** "
+                        "جرّب إيقاف «بثّ الإجابة تدريجياً» من اللوحة الجانبية، "
+                        "أو أعد المحاولة. إن تكرّر الأمر فقد يكون المزوّد يعيد "
+                        "ترميزاً غير UTF-8."
+                    )
+                    with st.expander("عرض النص الخام (للتشخيص)"):
+                        st.code(answer[:1000])
+                    answer = "⚠️ تعذّر عرض الإجابة بسبب خطأ في الترميز."
+
+                # 5) مؤشرات الجودة
                 grounded = prompting.verify_groundedness(answer, len(retrieval.chunks))
                 metric_cols = st.columns(4)
                 metric_cols[0].metric("⏱️ الاسترجاع", f"{retrieval_time:.2f}s")
